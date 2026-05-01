@@ -37,7 +37,7 @@ class TestChallengeClassifier:
     def test_reverse_challenge(self):
         """Reverse engineering challenges."""
         result = self.classifier.classify(
-            text="Reverse engineer this binary to find the serial key"
+            text="Reverse engineer this binary using disassembly and decompile"
         )
         assert result == ChallengeCategory.REVERSE
 

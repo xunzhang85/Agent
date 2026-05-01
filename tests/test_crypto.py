@@ -40,6 +40,6 @@ class TestCryptoTools:
 
     def test_frequency_analysis(self):
         """Frequency analysis should return sorted frequencies."""
-        freq = CryptoTools.frequency_analysis("aabbcc")
+        freq = CryptoTools.frequency_analysis("aaabbc")
         assert freq["a"] > freq["b"]
         assert abs(sum(freq.values()) - 1.0) < 0.01
