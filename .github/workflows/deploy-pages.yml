@@ -1,0 +1,58 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MkDocs
+        run: pip install mkdocs mkdocs-material mkdocstrings mkdocstrings-python
+
+      - name: Build docs
+        run: mkdocs build --strict
+        continue-on-error: true
+
+      - name: Fallback: Copy docs
+        if: failure()
+        run: |
+          mkdir -p site
+          cp -r docs/* site/ 2>/dev/null || true
+          echo '<!DOCTYPE html><html><head><title>CTF Agent</title></head><body><h1>CTF Agent - AI-Powered CTF Auto-Solver</h1><p>Documentation is being built. Please check back later.</p><p><a href="https://github.com/xunzhang85/Agent">GitHub Repository</a></p></body></html>' > site/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

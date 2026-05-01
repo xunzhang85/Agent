@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  agent:
+    build: .
+    container_name: ctf-agent
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./results:/workspace/results
+      - ./configs:/workspace/configs:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CTF_AGENT_MODEL=${CTF_AGENT_MODEL:-gpt-4o}
+      - CTF_AGENT_PROVIDER=${CTF_AGENT_PROVIDER:-openai}
+    networks:
+      - ctf-net
+    mem_limit: 2g
+    cpus: 2
+
+  # Sandbox for running untrusted exploits
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    container_name: ctf-sandbox
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    networks:
+      - ctf-net
+    mem_limit: 1g
+    cpus: 1
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  ctf-net:
+    driver: bridge
+    internal: true  # Isolated network for sandbox

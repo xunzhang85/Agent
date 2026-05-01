@@ -1,0 +1,49 @@
+# Example configuration for CTF Agent
+# Copy to configs/config.yaml and fill in your values
+
+llm:
+  # Supported providers: openai, anthropic, deepseek, ollama
+  provider: openai
+  model: gpt-4o
+  # API key can also be set via OPENAI_API_KEY env var
+  api_key: ${OPENAI_API_KEY}
+  temperature: 0.1
+  max_tokens: 4096
+
+agent:
+  max_iterations: 20      # Max planning iterations per solve attempt
+  timeout: 600            # Global timeout in seconds
+  retry_on_failure: true  # Retry if initial approach fails
+  max_retries: 3          # Max retry attempts
+
+sandbox:
+  enabled: true           # Run exploits in Docker sandbox
+  image: "ctf-agent:sandbox"
+  memory_limit: "2g"
+  network: "ctf-net"
+
+tools:
+  enabled:
+    - nmap
+    - curl
+    - sqlmap
+    - nikto
+    - gdb
+    - radare2
+    - binwalk
+    - strings
+    - file
+    - openssl
+    - python3
+    - gobuster
+    - ffuf
+    - john
+    - hashcat
+    - steghide
+    - ropper
+    - checksec
+
+output:
+  format: json            # json, yaml, or text
+  directory: ./results
+  verbose: true
