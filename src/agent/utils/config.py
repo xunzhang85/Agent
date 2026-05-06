@@ -9,6 +9,7 @@ import os
 import re
 import yaml
 import logging
+import copy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -59,7 +60,7 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
     Returns:
         Merged configuration dict
     """
-    config = DEFAULT_CONFIG.copy()
+    config = copy.deepcopy(DEFAULT_CONFIG)
 
     if config_path is None:
         # Search for config in standard locations
@@ -100,12 +101,17 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
         "OPENAI_API_KEY": ("llm", "api_key"),
         "CTF_AGENT_TIMEOUT": ("agent", "timeout"),
         "CTF_AGENT_MAX_ITERATIONS": ("agent", "max_iterations"),
+        "CTF_AGENT_SANDBOX_ENABLED": ("sandbox", "enabled"),
     }
 
     for env_var, path in env_overrides.items():
         value = os.environ.get(env_var)
         if value:
             _set_nested(config, path, value)
+
+    api_key = config.get("llm", {}).get("api_key")
+    if isinstance(api_key, str) and api_key.startswith("${") and api_key.endswith("}"):
+        config["llm"]["api_key"] = None
 
     return config
 
@@ -123,6 +129,13 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _set_nested(d: dict, path: tuple, value: Any) -> None:
     """Set a nested dict value by path."""
+    if isinstance(value, str):
+        if value.lower() in {"true", "yes", "1", "on"}:
+            value = True
+        elif value.lower() in {"false", "no", "0", "off"}:
+            value = False
+        elif value.isdigit():
+            value = int(value)
     for key in path[:-1]:
         d = d.setdefault(key, {})
     d[path[-1]] = value

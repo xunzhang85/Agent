@@ -45,6 +45,23 @@ class TestPlanner:
         plan = planner._fallback_plan(None, "test error")
         assert len(plan.actions) == 0
 
+    def test_auth_error_disables_repeated_llm_calls(self):
+        """Authentication failures should fall back once, then stop cleanly."""
+        planner = Planner()
+        planner._disable_llm_if_auth_error(Exception("401 invalid_api_key"))
+
+        first = planner.plan(challenge_url="http://target.com", category="web", previous_steps=[])
+        assert first.strategy == "fallback"
+        assert len(first.actions) > 0
+
+        second = planner.plan(
+            challenge_url="http://target.com",
+            category="web",
+            previous_steps=[f"[Plan] {first.reasoning}"],
+        )
+        assert second.strategy == "fallback_exhausted"
+        assert second.actions == []
+
     def test_build_prompt(self):
         """Prompt builder should include all context."""
         planner = Planner()

@@ -8,8 +8,10 @@ and async LLM calls.
 import json
 import logging
 import asyncio
+import shlex
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,7 @@ class Planner:
         self.provider = provider
         self.api_key = api_key
         self._client = None
+        self._llm_disabled_reason: Optional[str] = None
 
     def _get_client(self):
         if self._client is None:
@@ -229,23 +232,29 @@ Output ONLY valid JSON."""
              context="", previous_steps=None) -> Plan:
         """Sync plan generation."""
         user_prompt = self._build_prompt(challenge_url, challenge_text, category, context, previous_steps or [])
+        if self._llm_disabled_reason:
+            return self._fallback_plan(challenge_url, self._llm_disabled_reason, category, previous_steps)
         try:
             response = self._call_llm(PLANNER_SYSTEM_PROMPT, user_prompt)
             return self._parse_plan(response)
         except Exception as e:
             logger.error(f"Planner error: {e}")
-            return self._fallback_plan(challenge_url, e)
+            self._disable_llm_if_auth_error(e)
+            return self._fallback_plan(challenge_url, e, category, previous_steps)
 
     async def async_plan(self, challenge_url=None, challenge_text=None, category="unknown",
                          context="", previous_steps=None) -> Plan:
         """Async plan generation."""
         user_prompt = self._build_prompt(challenge_url, challenge_text, category, context, previous_steps or [])
+        if self._llm_disabled_reason:
+            return self._fallback_plan(challenge_url, self._llm_disabled_reason, category, previous_steps)
         try:
             response = await self.async_call_llm(PLANNER_SYSTEM_PROMPT, user_prompt)
             return self._parse_plan(response)
         except Exception as e:
             logger.error(f"Planner error: {e}")
-            return self._fallback_plan(challenge_url, e)
+            self._disable_llm_if_auth_error(e)
+            return self._fallback_plan(challenge_url, e, category, previous_steps)
 
     def _parse_plan(self, response: str) -> Plan:
         """Parse LLM response into a Plan object."""
@@ -274,18 +283,62 @@ Output ONLY valid JSON."""
             alternative_plans=data.get("alternative_plans", []),
         )
 
-    def _fallback_plan(self, url, error) -> Plan:
+    def _disable_llm_if_auth_error(self, error) -> None:
+        text = str(error).lower()
+        auth_markers = (
+            "401",
+            "unauthorized",
+            "incorrect api key",
+            "invalid_api_key",
+            "authentication",
+            "api key",
+        )
+        if any(marker in text for marker in auth_markers):
+            self._llm_disabled_reason = (
+                "LLM authentication failed. Check OPENAI_API_KEY or switch provider/model."
+            )
+
+    def _fallback_plan(self, url, error, category: str = "unknown", previous_steps=None) -> Plan:
         """Fallback plan when LLM fails."""
+        previous_steps = previous_steps or []
+        already_used_fallback = any("[Plan]" in step and "fallback reconnaissance" in step for step in previous_steps)
+        if already_used_fallback:
+            return Plan(
+                reasoning=(
+                    f"{error}; fallback reconnaissance already ran. "
+                    "No new deterministic actions are available without a working LLM."
+                ),
+                actions=[],
+                confidence=0.0,
+                strategy="fallback_exhausted",
+            )
+
         actions = []
         if url:
+            quoted_url = shlex.quote(url)
+            robots_url = shlex.quote(urljoin(url.rstrip("/") + "/", "robots.txt"))
+            flag_url = shlex.quote(urljoin(url.rstrip("/") + "/", "flag.txt"))
             actions.append(Action(
-                tool="curl", command=f"curl -s -I -L {url}",
+                tool="curl", command=f"curl -s -I -L --max-time 10 {quoted_url}",
                 description="HTTP header inspection",
             ))
             actions.append(Action(
-                tool="curl", command=f"curl -s {url} | head -200",
+                tool="curl", command=f"curl -s --max-time 10 {quoted_url} | head -200",
                 description="Page content inspection",
             ))
+            if category == "web":
+                actions.extend([
+                    Action(
+                        tool="curl",
+                        command=f"curl -s --max-time 10 {robots_url}",
+                        description="Check robots.txt for hidden paths",
+                    ),
+                    Action(
+                        tool="curl",
+                        command=f"curl -s --max-time 10 {flag_url}",
+                        description="Probe a common CTF flag path",
+                    ),
+                ])
         return Plan(
             reasoning=f"LLM error ({error}), using fallback reconnaissance",
             actions=actions, confidence=0.1, strategy="fallback",

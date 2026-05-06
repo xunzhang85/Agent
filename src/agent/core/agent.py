@@ -127,7 +127,7 @@ class CTFAgent:
         timeout: int = 600,
         retry_on_failure: bool = True,
         max_retries: int = 3,
-        sandbox_enabled: bool = True,
+        sandbox_enabled: Optional[bool] = None,
         cache_enabled: bool = True,
         on_progress: Optional[Callable] = None,
     ):
@@ -229,11 +229,15 @@ class CTFAgent:
                     previous_steps=steps,
                 )
 
-                if not plan.actions:
-                    break
-
                 steps.append(f"[Plan] {plan.reasoning[:200]}")
                 self._emit("plan", {"reasoning": plan.reasoning[:200], "solve_id": solve_id})
+
+                if not plan.actions:
+                    elapsed = time.time() - start_time
+                    return self._make_result(
+                        False, None, category, steps, iterations, elapsed,
+                        "Planner produced no executable actions", solve_id,
+                    )
 
                 # Execute actions (parallel where possible)
                 results = await self._execute_actions(plan.actions)
@@ -325,12 +329,18 @@ class CTFAgent:
                     previous_steps=steps,
                 )
 
-                if not plan.actions:
-                    yield {"type": "no_plan", "solve_id": solve_id}
-                    break
-
                 steps.append(f"[Plan] {plan.reasoning[:200]}")
                 yield {"type": "plan", "reasoning": plan.reasoning[:200], "actions": len(plan.actions), "solve_id": solve_id}
+
+                if not plan.actions:
+                    yield {
+                        "type": "failed",
+                        "error": "Planner produced no executable actions",
+                        "iterations": iterations,
+                        "elapsed": time.time() - start_time,
+                        "solve_id": solve_id,
+                    }
+                    return
 
                 results = await self._execute_actions(plan.actions)
                 for action, result in zip(plan.actions, results):

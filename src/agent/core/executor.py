@@ -6,15 +6,15 @@ sandboxed Docker execution with resource limits.
 """
 
 import asyncio
+import shlex
 import subprocess
 import logging
 import tempfile
 import time
 import hashlib
-import os
+import shutil
 from dataclasses import dataclass
 from typing import Optional
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from agent.tools.registry import ToolRegistry
@@ -71,19 +71,51 @@ class Executor:
         model: str = "gpt-4o",
         provider: str = "openai",
         api_key: Optional[str] = None,
-        sandbox_enabled: bool = True,
+        sandbox_enabled: Optional[bool] = None,
         sandbox_image: str = "ctf-agent:sandbox",
         timeout: int = 60,
         max_workers: int = 4,
         cache_ttl: int = 300,
     ):
-        self.sandbox_enabled = sandbox_enabled
         self.sandbox_image = sandbox_image
+        self.sandbox_enabled = self._resolve_sandbox(sandbox_enabled)
         self.timeout = timeout
         self.tool_registry = ToolRegistry()
         self._working_dir = tempfile.mkdtemp(prefix="ctf_agent_")
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._cache = CommandCache(ttl=cache_ttl)
+
+    def _resolve_sandbox(self, requested: Optional[bool]) -> bool:
+        """Enable Docker sandbox only when the local runtime can actually use it."""
+        if requested is False:
+            return False
+
+        docker = shutil.which("docker")
+        if not docker:
+            if requested:
+                logger.warning("Docker sandbox requested but docker is not installed; using local execution")
+            return False
+
+        try:
+            image = subprocess.run(
+                [docker, "image", "inspect", self.sandbox_image],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Docker sandbox check failed (%s); using local execution", exc)
+            return False
+
+        if image.returncode != 0:
+            if requested:
+                logger.warning(
+                    "Docker sandbox image %s is not available; using local execution",
+                    self.sandbox_image,
+                )
+            return False
+
+        return True
 
     def execute(self, action, timeout: Optional[int] = None) -> ExecutionResult:
         """Sync execute an action."""
@@ -164,13 +196,14 @@ class Executor:
         """Async reconnaissance."""
         commands = []
         if url:
+            quoted_url = shlex.quote(url)
             commands.extend([
-                f"curl -s -I -L --max-time 10 {url}",
-                f"curl -s --max-time 10 {url} | head -150",
+                f"curl -s -I -L --max-time 10 {quoted_url}",
+                f"curl -s --max-time 10 {quoted_url} | head -150",
             ])
         if text:
             # Extract URLs from text
-            commands.append(f"echo '{text[:500]}' | grep -oE 'https?://[^ ]+' || true")
+            commands.append(f"printf '%s\\n' {shlex.quote(text[:500])} | grep -oE 'https?://[^ ]+' || true")
 
         if not commands:
             return ExecutionResult(success=True, output="No reconnaissance targets", tool="recon")

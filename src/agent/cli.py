@@ -8,6 +8,8 @@ import sys
 import json
 import asyncio
 import logging
+import argparse
+import shlex
 import click
 from pathlib import Path
 from rich.console import Console
@@ -19,6 +21,7 @@ from rich.tree import Tree
 from rich.syntax import Syntax
 
 console = Console()
+CATEGORIES = ["web", "crypto", "pwn", "reverse", "forensics", "misc", "auto"]
 
 
 @click.group()
@@ -35,20 +38,43 @@ def main(ctx, verbose, config):
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
+def _load_runtime_config(ctx) -> dict:
+    from agent.utils.config import load_config
+
+    return load_config(ctx.obj.get("config") if ctx and ctx.obj else None)
+
+
+def _agent_kwargs(ctx, model=None, provider=None, timeout=None, sandbox_enabled=None) -> dict:
+    config = _load_runtime_config(ctx)
+    llm = config.get("llm", {})
+    agent_cfg = config.get("agent", {})
+    sandbox_cfg = config.get("sandbox", {})
+
+    return {
+        "model": model or llm.get("model") or "gpt-4o",
+        "provider": provider or llm.get("provider") or "openai",
+        "api_key": llm.get("api_key"),
+        "timeout": timeout or int(agent_cfg.get("timeout") or 600),
+        "max_iterations": int(agent_cfg.get("max_iterations") or 20),
+        "retry_on_failure": bool(agent_cfg.get("retry_on_failure", True)),
+        "max_retries": int(agent_cfg.get("max_retries") or 3),
+        "sandbox_enabled": sandbox_enabled if sandbox_enabled is not None else sandbox_cfg.get("enabled"),
+    }
+
+
 @main.command()
 @click.option("--url", "-u", help="Challenge URL")
 @click.option("--text", "-t", help="Challenge description")
-@click.option("--category", "-C", type=click.Choice(
-    ["web", "crypto", "pwn", "reverse", "forensics", "misc", "auto"],
-), default="auto", help="Challenge category")
-@click.option("--model", "-m", default="gpt-4o", help="LLM model")
-@click.option("--provider", "-p", default="openai", help="LLM provider")
+@click.option("--category", "-C", type=click.Choice(CATEGORIES), default="auto", help="Challenge category")
+@click.option("--model", "-m", default=None, help="LLM model")
+@click.option("--provider", "-p", default=None, help="LLM provider")
 @click.option("--timeout", type=int, default=600, help="Timeout in seconds")
 @click.option("--output", "-o", type=click.Path(), help="Output JSON file")
 @click.option("--no-cache", is_flag=True, help="Disable result caching")
 @click.option("--stream", "-s", is_flag=True, help="Stream solving progress")
+@click.option("--sandbox/--no-sandbox", default=None, help="Force Docker sandbox on/off. Default: config/auto.")
 @click.pass_context
-def solve(ctx, url, text, category, model, provider, timeout, output, no_cache, stream):
+def solve(ctx, url, text, category, model, provider, timeout, output, no_cache, stream, sandbox):
     """🎯 Solve a CTF challenge."""
     from agent.core.agent import CTFAgent
 
@@ -57,18 +83,19 @@ def solve(ctx, url, text, category, model, provider, timeout, output, no_cache, 
         sys.exit(1)
 
     cat = None if category == "auto" else category
+    kwargs = _agent_kwargs(ctx, model=model, provider=provider, timeout=timeout, sandbox_enabled=sandbox)
 
     console.print(Panel(
         f"[bold cyan]Challenge[/bold cyan]\n"
         f"  URL:      {url or 'N/A'}\n"
         f"  Category: {category}\n"
-        f"  Model:    {model} ({provider})\n"
+        f"  Model:    {kwargs['model']} ({kwargs['provider']})\n"
         f"  Timeout:  {timeout}s\n"
         f"  Cache:    {'off' if no_cache else 'on'}",
         title="🤖 CTF Agent v0.2", border_style="blue",
     ))
 
-    agent = CTFAgent(model=model, provider=provider, timeout=timeout, cache_enabled=not no_cache)
+    agent = CTFAgent(**kwargs, cache_enabled=not no_cache)
 
     if stream:
         asyncio.run(_solve_stream(agent, url, text, cat, output))
@@ -171,7 +198,7 @@ def batch(ctx, file, output, parallel):
 
     console.print(f"[cyan]📋 Loading {len(challenges)} challenges (parallel={parallel})[/cyan]")
 
-    agent = CTFAgent()
+    agent = CTFAgent(**_agent_kwargs(ctx))
     results = []
 
     with Progress(console=console) as progress:
@@ -204,7 +231,7 @@ def interactive(ctx):
     console.print(Panel(
         "[bold]Interactive CTF Agent[/bold]\n\n"
         "Commands:\n"
-        "  /solve <url>   - Solve a challenge\n"
+        "  /solve <url> [--category web] - Solve a challenge\n"
         "  /tools         - List available tools\n"
         "  /history       - Show solve history\n"
         "  /stats         - Show statistics\n"
@@ -213,7 +240,7 @@ def interactive(ctx):
         title="🤖 Interactive Mode", border_style="cyan",
     ))
 
-    agent = CTFAgent()
+    agent = CTFAgent(**_agent_kwargs(ctx))
 
     while True:
         try:
@@ -237,10 +264,23 @@ def interactive(ctx):
             agent.memory.clear()
             console.print("[green]Memory cleared[/green]")
         elif cmd.startswith("/solve "):
-            target = cmd[7:].strip()
-            url = target if target.startswith("http") else None
-            text = None if url else target
-            result = agent.solve(challenge_url=url, challenge_text=text)
+            try:
+                parsed = _parse_interactive_solve(cmd)
+            except ValueError as exc:
+                console.print(f"[red]Error: {exc}[/red]")
+                continue
+
+            run_agent = agent
+            if parsed["model"] or parsed["provider"]:
+                run_agent = CTFAgent(**_agent_kwargs(ctx, model=parsed["model"], provider=parsed["provider"]))
+
+            result = run_agent.solve(
+                challenge_url=parsed["url"],
+                challenge_text=parsed["text"],
+                category=parsed["category"],
+                timeout=parsed["timeout"],
+                use_cache=not parsed["no_cache"],
+            )
             _display_result(result, None)
         else:
             # Treat as challenge text
@@ -248,6 +288,53 @@ def interactive(ctx):
             _display_result(result, None)
 
     console.print("[dim]👋 Goodbye![/dim]")
+
+
+def _parse_interactive_solve(command: str) -> dict:
+    """Parse `/solve` commands without appending options to the URL."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"Invalid quoting: {exc}") from exc
+
+    parser = argparse.ArgumentParser(prog="/solve", add_help=False)
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("--url", "-u")
+    parser.add_argument("--text", "-t")
+    parser.add_argument("--category", "-C", choices=CATEGORIES)
+    parser.add_argument("--model", "-m")
+    parser.add_argument("--provider", "-p")
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--no-cache", action="store_true")
+
+    try:
+        args, unknown = parser.parse_known_args(tokens[1:])
+    except SystemExit as exc:
+        raise ValueError("Usage: /solve <url-or-text> [--category web] [--timeout 300]") from exc
+
+    if unknown:
+        raise ValueError(f"Unknown option(s): {' '.join(unknown)}")
+
+    url = args.url
+    text = args.text
+    if not url and not text and args.target:
+        if args.target.startswith(("http://", "https://")):
+            url = args.target
+        else:
+            text = args.target
+
+    if not url and not text:
+        raise ValueError("Usage: /solve <url-or-text> [--category web]")
+
+    return {
+        "url": url,
+        "text": text,
+        "category": None if args.category in (None, "auto") else args.category,
+        "model": args.model,
+        "provider": args.provider,
+        "timeout": args.timeout,
+        "no_cache": args.no_cache,
+    }
 
 
 @main.command()
@@ -322,10 +409,21 @@ def _add_history_row(table, name, data):
 @main.command()
 @click.option("--port", type=int, default=8080, help="Server port")
 @click.option("--host", default="0.0.0.0", help="Bind host")
-def serve(port, host):
+@click.pass_context
+def serve(ctx, port, host):
     """🌐 Start web dashboard."""
     from agent.web import start_web
-    start_web(port=port, host=host)
+    start_web(port=port, host=host, config_path=ctx.obj.get("config"))
+
+
+@main.command(name="web")
+@click.option("--port", type=int, default=8080, help="Server port")
+@click.option("--host", default="127.0.0.1", help="Bind host")
+@click.pass_context
+def web_dashboard(ctx, port, host):
+    """🌐 Start web dashboard (alias for serve)."""
+    from agent.web import start_web
+    start_web(port=port, host=host, config_path=ctx.obj.get("config"))
 
 
 if __name__ == "__main__":

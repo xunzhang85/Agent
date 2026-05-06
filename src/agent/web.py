@@ -6,11 +6,8 @@ and API endpoints for integration.
 """
 
 import json
-import asyncio
 import logging
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -105,7 +102,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <label>Challenge Description / Hints</label>
                     <textarea id="fText" placeholder="Paste challenge description, hints, or any context..."></textarea>
                 </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
                     <div class="form-group">
                         <label>Category</label>
                         <select id="fCat">
@@ -125,6 +122,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <option value="gpt-4o-mini">GPT-4o Mini</option>
                             <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
                             <option value="deepseek-chat">DeepSeek</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Provider</label>
+                        <select id="fProvider">
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic</option>
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="ollama">Ollama</option>
                         </select>
                     </div>
                 </div>
@@ -210,14 +216,15 @@ $('#solveForm').addEventListener('submit',async e=>{
     const btn=$('#solveBtn'),log=$('#solveLog'),box=$('#resultBox');
     btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Solving...';
     box.classList.remove('hidden');log.innerHTML='';
-    const url=$('#fUrl').value,text=$('#fText').value,cat=$('#fCat').value,model=$('#fModel').value;
+    const url=$('#fUrl').value,text=$('#fText').value,cat=$('#fCat').value,model=$('#fModel').value,provider=$('#fProvider').value;
 
     addLog('🧠 Analyzing challenge...','log-plan');
 
     try{
         const resp=await fetch(API+'/api/solve',{method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({url,text,category:cat==='auto'?null:cat,model})});
+            body:JSON.stringify({url,text,category:cat==='auto'?null:cat,model,provider})});
         const data=await resp.json();
+        if(!resp.ok) throw new Error(data.error||'Request failed');
 
         if(data.success){
             addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━','log-line');
@@ -292,11 +299,36 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/solve":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_length))
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(content_length) or b"{}")
+            except json.JSONDecodeError:
+                self._respond(400, "application/json", json.dumps({"error": "Invalid JSON"}))
+                return
+
+            if not body.get("url") and not body.get("text"):
+                self._respond(400, "application/json", json.dumps({"error": "Provide url or text"}))
+                return
 
             from agent.core.agent import CTFAgent
-            agent = CTFAgent(model=body.get("model", "gpt-4o"))
+            from agent.utils.config import load_config
+
+            config = load_config(getattr(self.server, "config_path", None))
+            llm = config.get("llm", {})
+            agent_cfg = config.get("agent", {})
+            sandbox_cfg = config.get("sandbox", {})
+
+            agent = CTFAgent(
+                model=body.get("model") or llm.get("model") or "gpt-4o",
+                provider=body.get("provider") or llm.get("provider") or "openai",
+                api_key=llm.get("api_key"),
+                timeout=int(body.get("timeout") or agent_cfg.get("timeout") or 600),
+                max_iterations=int(agent_cfg.get("max_iterations") or 20),
+                max_retries=int(agent_cfg.get("max_retries") or 3),
+                retry_on_failure=bool(agent_cfg.get("retry_on_failure", True)),
+                sandbox_enabled=sandbox_cfg.get("enabled"),
+                cache_enabled=not body.get("no_cache", False),
+            )
 
             result = agent.solve(
                 challenge_url=body.get("url"),
@@ -325,9 +357,17 @@ class WebHandler(BaseHTTPRequestHandler):
         logger.info(f"{self.client_address[0]} - {format % args}")
 
 
-def start_web(port: int = 8080, host: str = "0.0.0.0"):
+class AgentHTTPServer(HTTPServer):
+    """HTTP server carrying runtime configuration path."""
+
+    def __init__(self, server_address, handler_class, config_path=None):
+        super().__init__(server_address, handler_class)
+        self.config_path = config_path
+
+
+def start_web(port: int = 8080, host: str = "0.0.0.0", config_path: str | None = None):
     """Start the web dashboard."""
-    server = HTTPServer((host, port), WebHandler)
+    server = AgentHTTPServer((host, port), WebHandler, config_path=config_path)
     print(f"\n  🌐 CTF Agent Web Dashboard")
     print(f"  ➜ Local:   http://localhost:{port}")
     print(f"  ➜ Network: http://{host}:{port}")

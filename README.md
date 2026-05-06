@@ -68,14 +68,14 @@ pip install -e ".[dev]"
 
 # 配置 LLM API
 cp configs/config.example.yaml configs/config.yaml
-# 编辑 config.yaml，填入你的 API Key
+# 编辑 config.yaml，填入你的 API Key，或设置 OPENAI_API_KEY
 ```
 
 ### Docker 方式
 
 ```bash
 docker-compose up -d
-docker exec -it ctf-agent agent solve --challenge "http://target.ctf.com"
+docker exec -it ctf-agent agent solve --url "http://target.ctf.com" --category web
 ```
 
 ### 命令行使用
@@ -90,8 +90,29 @@ agent batch --file challenges.txt --output results.json
 # 交互模式
 agent interactive
 
+# Web 前端
+agent web --host 127.0.0.1 --port 8080
+# 浏览器打开 http://127.0.0.1:8080
+
 # 查看解题历史
-agent history --stats
+agent history
+```
+
+交互模式支持带参数的 `/solve` 命令：
+
+```text
+ctf> /solve http://challenge.ctfplus.cn --category web --timeout 300
+```
+
+### Kali / 本地运行注意事项
+
+- 默认会读取 `configs/config.yaml` 和环境变量 `OPENAI_API_KEY`。如果看到 `401 Unauthorized` 或 `invalid_api_key`，请重新设置有效 Key，或在配置里切换到 `deepseek` / `anthropic` / `ollama`。
+- Docker 沙箱会自动检测：没有安装 Docker 或没有构建 `ctf-agent:sandbox` 镜像时，Agent 会降级为本地执行，不会再因为 `No such file or directory: 'docker'` 反复失败。
+- 如果你想强制关闭沙箱，可以使用：
+
+```bash
+agent solve --url http://challenge.ctf.com --category web --no-sandbox
+export CTF_AGENT_SANDBOX_ENABLED=false
 ```
 
 ### Python API
@@ -174,7 +195,7 @@ agent:
   max_retries: 3
 
 sandbox:
-  enabled: true
+  enabled: true  # Docker 不可用时会自动降级为本地执行
   image: "ctf-agent:sandbox"
   memory_limit: "2g"
   network: "ctf-net"
