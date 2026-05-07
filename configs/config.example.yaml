@@ -9,6 +9,9 @@ llm:
   api_key: ${OPENAI_API_KEY}
   # For OpenAI-compatible providers such as MiMo, set base_url and model:
   # provider: openai
+  # Friendly names such as MiMo-V2.5-Pro are normalized to API slug mimo-v2.5-pro.
+  # You can also set the slug directly:
+  # model: mimo-v2.5-pro
   # model: MiMo-V2.5-Pro
   # base_url: https://token-plan-sgp.xiaomimimo.com/v1
   base_url:

@@ -55,6 +55,7 @@ class TestPlanner:
         )
 
         assert planner.base_url == "https://token-plan-sgp.xiaomimimo.com/v1"
+        assert planner.api_model == "mimo-v2.5-pro"
 
     def test_web_fallback_probes_php_eval_parameter(self):
         """Fallback web recon should include a deterministic PHP eval POST probe."""

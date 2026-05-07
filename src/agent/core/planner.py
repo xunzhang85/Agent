@@ -166,12 +166,23 @@ class Planner:
     ):
         self.model = model
         self.provider = provider
+        self.api_model = self._normalize_model_name(model, provider)
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") if isinstance(base_url, str) and base_url.strip() else None
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._client = None
         self._llm_disabled_reason: Optional[str] = None
+
+    @staticmethod
+    def _normalize_model_name(model: str, provider: str) -> str:
+        """Normalize friendly model names to provider API slugs."""
+        normalized = (model or "").strip()
+        if normalized.lower().startswith("mimo-"):
+            return normalized.lower()
+        if provider in {"mimo", "openai-compatible"} and "mimo" in normalized.lower():
+            return normalized.lower()
+        return normalized
 
     def _get_client(self):
         if self._client is None:
@@ -227,14 +238,14 @@ Output ONLY valid JSON."""
         client = self._get_client()
         if self.provider == "anthropic":
             response = client.messages.create(
-                model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
+                model=self.api_model, max_tokens=self.max_tokens, temperature=self.temperature,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
             return response.content[0].text
         else:
             response = client.chat.completions.create(
-                model=self.model, temperature=self.temperature, max_tokens=self.max_tokens,
+                model=self.api_model, temperature=self.temperature, max_tokens=self.max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -315,6 +326,11 @@ Output ONLY valid JSON."""
         if any(marker in text for marker in auth_markers):
             self._llm_disabled_reason = (
                 "LLM authentication failed. Check OPENAI_API_KEY or switch provider/model."
+            )
+        elif "not supported model" in text or "unsupported model" in text:
+            self._llm_disabled_reason = (
+                f"LLM model {self.model!r} is not supported by this endpoint. "
+                f"Try API model slug {self.api_model!r} or check llm.model."
             )
 
     def _fallback_plan(self, url, error, category: str = "unknown", previous_steps=None) -> Plan:
