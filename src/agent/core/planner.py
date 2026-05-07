@@ -9,6 +9,7 @@ and automatic fallback model switching.
 import json
 import logging
 import asyncio
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Optional
@@ -28,6 +29,7 @@ MODEL_ALIASES = {
     "minimax-text-01": "MiniMax-Text-01",
     "minimax-m1": "MiniMax-M1",
     "minimax-m2": "MiniMax-M2",
+    "minimax-m2.7": "MiniMax-M2.7",
 }
 
 # Default base URLs for providers that have built-in endpoints
@@ -330,6 +332,11 @@ Output ONLY valid JSON."""
     def _parse_plan(self, response: str) -> Plan:
         """Parse LLM response into a Plan object."""
         response = response.strip()
+
+        # Strip <think>...</think> blocks (MiniMax, MiMo reasoning models)
+        response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+        # Strip markdown code blocks
         if response.startswith("```"):
             lines = response.split("\n")
             response = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])

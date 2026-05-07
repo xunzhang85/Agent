@@ -2,29 +2,40 @@
 # Copy to configs/config.yaml and fill in your values
 
 llm:
-  # Supported providers: openai, openai-compatible, mimo, anthropic, deepseek, ollama, minimax, minimax-cn
-  provider: mimo
-  model: mimo-v2.5-pro
-  # API key — set via environment variable or directly here
-  # export XIAOMI_API_KEY=your-key-here
-  api_key: ${XIAOMI_API_KEY}
-  # MiMo main platform endpoint (NOT the token-plan endpoint)
-  base_url: https://api.xiaomimimo.com/v1
+  # ── Primary: MiniMax (confirmed working) ──
+  provider: minimax
+  model: MiniMax-M2.7
+  api_key: ${MINIMAX_API_KEY}
+  base_url: https://api.minimax.chat/v1
   temperature: 0.1
   max_tokens: 4096
 
-  # ── Fallback: when primary model fails (e.g. model not supported), auto-switch here ──
+  # ── Fallback: MiMo (activate when your key works) ──
   fallback:
-    provider: minimax
-    model: MiniMax-Text-01
-    # export MINIMAX_API_KEY=your-key-here
-    api_key: ${MINIMAX_API_KEY}
-    base_url: https://api.minimax.chat/v1
-    # For China mainland, use:
-    # provider: minimax-cn
-    # base_url: https://api.minimaxi.com/v1
+    provider: mimo
+    model: mimo-v2.5-pro
+    api_key: ${XIAOMI_API_KEY}
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
 
   # ── Alternative configs (comment/uncomment as needed) ──
+
+  # MiMo Token Plan (China) — set XIAOMI_API_KEY env var
+  # provider: mimo
+  # model: mimo-v2.5-pro
+  # api_key: ${XIAOMI_API_KEY}
+  # base_url: https://token-plan-cn.xiaomimimo.com/v1
+
+  # MiMo Token Plan (Singapore)
+  # provider: mimo
+  # model: mimo-v2.5-pro
+  # api_key: ${XIAOMI_API_KEY}
+  # base_url: https://token-plan-sgp.xiaomimimo.com/v1
+
+  # MiMo Main Platform (sk-xxxxx key, not tp-xxxxx)
+  # provider: mimo
+  # model: mimo-v2.5-pro
+  # api_key: ${XIAOMI_API_KEY}
+  # base_url: https://api.xiaomimimo.com/v1
 
   # OpenAI
   # provider: openai
