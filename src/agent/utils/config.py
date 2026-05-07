@@ -23,6 +23,12 @@ DEFAULT_CONFIG = {
         "base_url": None,
         "temperature": 0.1,
         "max_tokens": 4096,
+        "fallback": {
+            "provider": None,
+            "model": None,
+            "api_key": None,
+            "base_url": None,
+        },
     },
     "agent": {
         "max_iterations": 20,
@@ -103,6 +109,11 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
         "OPENAI_BASE_URL": ("llm", "base_url"),
         "OPENAI_API_KEY": ("llm", "api_key"),
         "LLM_API_KEY": ("llm", "api_key"),
+        "XIAOMI_API_KEY": ("llm", "api_key"),
+        "MINIMAX_API_KEY": ("llm", "fallback", "api_key"),
+        "CTF_AGENT_FALLBACK_MODEL": ("llm", "fallback", "model"),
+        "CTF_AGENT_FALLBACK_PROVIDER": ("llm", "fallback", "provider"),
+        "CTF_AGENT_FALLBACK_BASE_URL": ("llm", "fallback", "base_url"),
         "CTF_AGENT_TIMEOUT": ("agent", "timeout"),
         "CTF_AGENT_MAX_ITERATIONS": ("agent", "max_iterations"),
         "CTF_AGENT_SANDBOX_ENABLED": ("sandbox", "enabled"),
@@ -120,6 +131,17 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
     if isinstance(base_url, str):
         base_url = base_url.strip()
         config["llm"]["base_url"] = base_url.rstrip("/") if base_url else None
+
+    # Clean up fallback config
+    fallback = config.get("llm", {}).get("fallback", {})
+    if fallback:
+        fb_key = fallback.get("api_key")
+        if isinstance(fb_key, str) and fb_key.startswith("${") and fb_key.endswith("}"):
+            fallback["api_key"] = None
+        fb_url = fallback.get("base_url")
+        if isinstance(fb_url, str):
+            fb_url = fb_url.strip()
+            fallback["base_url"] = fb_url.rstrip("/") if fb_url else None
 
     return config
 

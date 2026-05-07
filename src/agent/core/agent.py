@@ -133,6 +133,10 @@ class CTFAgent:
         sandbox_enabled: Optional[bool] = None,
         cache_enabled: bool = True,
         on_progress: Optional[Callable] = None,
+        fallback_model: Optional[str] = None,
+        fallback_provider: Optional[str] = None,
+        fallback_api_key: Optional[str] = None,
+        fallback_base_url: Optional[str] = None,
     ):
         self.model = model
         self.provider = provider
@@ -141,6 +145,13 @@ class CTFAgent:
         self.retry_on_failure = retry_on_failure
         self.max_retries = max_retries
         self.on_progress = on_progress
+
+        # Fallback model config
+        self.fallback_model = fallback_model
+        self.fallback_provider = fallback_provider
+        self.fallback_api_key = fallback_api_key
+        self.fallback_base_url = fallback_base_url
+        self._using_fallback = False
 
         self.memory = Memory()
         self.classifier = ChallengeClassifier()
@@ -160,6 +171,8 @@ class CTFAgent:
         self.cache = ResultCache() if cache_enabled else None
 
         logger.info(f"CTFAgent initialized: model={model}, provider={provider}")
+        if self.fallback_model:
+            logger.info(f"Fallback model: {self.fallback_model} ({self.fallback_provider})")
 
     def _emit(self, event_type: str, data: dict):
         """Emit progress event to callback."""
@@ -241,6 +254,25 @@ class CTFAgent:
 
                 steps.append(f"[Plan] {plan.reasoning[:200]}")
                 self._emit("plan", {"reasoning": plan.reasoning[:200], "solve_id": solve_id})
+
+                # Check if primary model failed and fallback is available
+                if hasattr(self.planner, '_model_unsupported') and self.planner._model_unsupported:
+                    if self.fallback_model and not self._using_fallback:
+                        logger.warning(f"Primary model unsupported, switching to fallback: {self.fallback_model}")
+                        self.planner = Planner(
+                            model=self.fallback_model,
+                            provider=self.fallback_provider or "openai",
+                            api_key=self.fallback_api_key,
+                            base_url=self.fallback_base_url,
+                        )
+                        self._using_fallback = True
+                        steps.append(f"[Fallback] Switching to {self.fallback_model} ({self.fallback_provider})")
+                        self._emit("fallback", {
+                            "model": self.fallback_model,
+                            "provider": self.fallback_provider,
+                            "solve_id": solve_id,
+                        })
+                        continue  # Retry with fallback model
 
                 if not plan.actions:
                     elapsed = time.time() - start_time

