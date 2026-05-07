@@ -15,13 +15,20 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.live import Live
-from rich.tree import Tree
-from rich.syntax import Syntax
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
 CATEGORIES = ["web", "crypto", "pwn", "reverse", "forensics", "misc", "auto"]
+INTERACTIVE_HELP = (
+    "Commands:\n"
+    "  /solve <url> [--category web] - Solve a challenge\n"
+    "  /tools         - List available tools\n"
+    "  /history       - Show solve history\n"
+    "  /stats         - Show memory statistics\n"
+    "  /config        - Show active runtime config\n"
+    "  /clear         - Clear memory\n"
+    "  /quit          - Exit"
+)
 
 
 @click.group()
@@ -45,19 +52,23 @@ def _load_runtime_config(ctx) -> dict:
 
 
 def _agent_kwargs(ctx, model=None, provider=None, timeout=None, sandbox_enabled=None) -> dict:
+    from agent.utils.config import get_bool, get_float, get_int
+
     config = _load_runtime_config(ctx)
     llm = config.get("llm", {})
-    agent_cfg = config.get("agent", {})
     sandbox_cfg = config.get("sandbox", {})
 
     return {
         "model": model or llm.get("model") or "gpt-4o",
         "provider": provider or llm.get("provider") or "openai",
         "api_key": llm.get("api_key"),
-        "timeout": timeout or int(agent_cfg.get("timeout") or 600),
-        "max_iterations": int(agent_cfg.get("max_iterations") or 20),
-        "retry_on_failure": bool(agent_cfg.get("retry_on_failure", True)),
-        "max_retries": int(agent_cfg.get("max_retries") or 3),
+        "base_url": llm.get("base_url"),
+        "temperature": get_float(config, ("llm", "temperature"), 0.1),
+        "max_tokens": get_int(config, ("llm", "max_tokens"), 4096),
+        "timeout": timeout or get_int(config, ("agent", "timeout"), 600),
+        "max_iterations": get_int(config, ("agent", "max_iterations"), 20),
+        "retry_on_failure": get_bool(config, ("agent", "retry_on_failure"), True),
+        "max_retries": get_int(config, ("agent", "max_retries"), 3),
         "sandbox_enabled": sandbox_enabled if sandbox_enabled is not None else sandbox_cfg.get("enabled"),
     }
 
@@ -230,17 +241,12 @@ def interactive(ctx):
 
     console.print(Panel(
         "[bold]Interactive CTF Agent[/bold]\n\n"
-        "Commands:\n"
-        "  /solve <url> [--category web] - Solve a challenge\n"
-        "  /tools         - List available tools\n"
-        "  /history       - Show solve history\n"
-        "  /stats         - Show statistics\n"
-        "  /clear         - Clear memory\n"
-        "  /quit          - Exit",
+        f"{INTERACTIVE_HELP}",
         title="🤖 Interactive Mode", border_style="cyan",
     ))
 
-    agent = CTFAgent(**_agent_kwargs(ctx))
+    kwargs = _agent_kwargs(ctx)
+    agent = CTFAgent(**kwargs)
 
     while True:
         try:
@@ -253,6 +259,8 @@ def interactive(ctx):
             continue
         if cmd in ("/quit", "/exit", "/q"):
             break
+        elif cmd in ("/help", "/h", "?"):
+            console.print(Panel(INTERACTIVE_HELP, title="Help", border_style="cyan"))
         elif cmd == "/tools":
             _show_tools()
         elif cmd == "/history":
@@ -260,6 +268,18 @@ def interactive(ctx):
         elif cmd == "/stats":
             summary = agent.memory.get_summary()
             console.print(Panel(json.dumps(summary, indent=2), title="📊 Memory Stats"))
+        elif cmd == "/config":
+            safe_config = {
+                "model": kwargs["model"],
+                "provider": kwargs["provider"],
+                "base_url_configured": bool(kwargs.get("base_url")),
+                "timeout": kwargs["timeout"],
+                "max_iterations": kwargs["max_iterations"],
+                "max_retries": kwargs["max_retries"],
+                "sandbox_enabled": kwargs["sandbox_enabled"],
+                "api_key_configured": bool(kwargs.get("api_key")),
+            }
+            console.print(Panel(json.dumps(safe_config, indent=2), title="⚙️ Runtime Config"))
         elif cmd == "/clear":
             agent.memory.clear()
             console.print("[green]Memory cleared[/green]")

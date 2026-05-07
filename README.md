@@ -102,12 +102,15 @@ agent history
 
 ```text
 ctf> /solve http://challenge.ctfplus.cn --category web --timeout 300
+ctf> /config
 ```
 
 ### Kali / 本地运行注意事项
 
-- 默认会读取 `configs/config.yaml` 和环境变量 `OPENAI_API_KEY`。如果看到 `401 Unauthorized` 或 `invalid_api_key`，请重新设置有效 Key，或在配置里切换到 `deepseek` / `anthropic` / `ollama`。
+- 默认会读取 `configs/config.yaml` 和环境变量 `OPENAI_API_KEY` / `LLM_API_KEY`。如果看到 `401 Unauthorized` 或 `invalid_api_key`，请重新设置有效 Key，或在配置里切换到 `deepseek` / `anthropic` / `ollama`。
+- MiMo 这类 OpenAI-compatible 接口需要配置 `llm.base_url`，例如 `https://token-plan-sgp.xiaomimimo.com/v1`。Web 前端会自动把配置里的 `MiMo-V2.5-Pro` 放进模型下拉框。
 - Docker 沙箱会自动检测：没有安装 Docker 或没有构建 `ctf-agent:sandbox` 镜像时，Agent 会降级为本地执行，不会再因为 `No such file or directory: 'docker'` 反复失败。
+- Web 前端会从后端读取当前 model/provider/timeout/sandbox 默认值，并支持 `No cache`、`No sandbox`、`Timeout` 控制。
 - 如果你想强制关闭沙箱，可以使用：
 
 ```bash
@@ -182,9 +185,10 @@ Agent/
 ```yaml
 # configs/config.yaml
 llm:
-  provider: openai  # openai / anthropic / deepseek / ollama
-  model: gpt-4o
+  provider: openai  # openai / openai-compatible / mimo / anthropic / deepseek / ollama
+  model: MiMo-V2.5-Pro
   api_key: ${OPENAI_API_KEY}
+  base_url: https://token-plan-sgp.xiaomimimo.com/v1
   temperature: 0.1
   max_tokens: 4096
 
@@ -220,7 +224,7 @@ tools:
 pytest
 
 # 运行特定类别测试
-pytest tests/test_web.py -v
+pytest tests/test_cli.py tests/test_executor.py tests/test_planner.py -v
 
 # 生成覆盖率报告
 pytest --cov=agent --cov-report=html

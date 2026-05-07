@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
         "provider": "openai",
         "model": "gpt-4o",
         "api_key": None,
+        "base_url": None,
         "temperature": 0.1,
         "max_tokens": 4096,
     },
@@ -98,7 +99,10 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
     env_overrides = {
         "CTF_AGENT_MODEL": ("llm", "model"),
         "CTF_AGENT_PROVIDER": ("llm", "provider"),
+        "CTF_AGENT_BASE_URL": ("llm", "base_url"),
+        "OPENAI_BASE_URL": ("llm", "base_url"),
         "OPENAI_API_KEY": ("llm", "api_key"),
+        "LLM_API_KEY": ("llm", "api_key"),
         "CTF_AGENT_TIMEOUT": ("agent", "timeout"),
         "CTF_AGENT_MAX_ITERATIONS": ("agent", "max_iterations"),
         "CTF_AGENT_SANDBOX_ENABLED": ("sandbox", "enabled"),
@@ -112,8 +116,46 @@ def load_config(config_path: Optional[str] = None) -> dict[str, Any]:
     api_key = config.get("llm", {}).get("api_key")
     if isinstance(api_key, str) and api_key.startswith("${") and api_key.endswith("}"):
         config["llm"]["api_key"] = None
+    base_url = config.get("llm", {}).get("base_url")
+    if isinstance(base_url, str):
+        base_url = base_url.strip()
+        config["llm"]["base_url"] = base_url.rstrip("/") if base_url else None
 
     return config
+
+
+def get_bool(config: dict[str, Any], path: tuple[str, ...], default: bool = False) -> bool:
+    """Read a nested boolean config value with string coercion."""
+    value = _get_nested(config, path, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "on"}:
+            return True
+        if normalized in {"false", "no", "0", "off"}:
+            return False
+    return bool(value)
+
+
+def get_int(config: dict[str, Any], path: tuple[str, ...], default: int) -> int:
+    """Read a nested integer config value with safe fallback."""
+    value = _get_nested(config, path, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid integer config %s=%r, using %s", ".".join(path), value, default)
+        return default
+
+
+def get_float(config: dict[str, Any], path: tuple[str, ...], default: float) -> float:
+    """Read a nested float config value with safe fallback."""
+    value = _get_nested(config, path, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid float config %s=%r, using %s", ".".join(path), value, default)
+        return default
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -125,6 +167,15 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _get_nested(d: dict, path: tuple[str, ...], default: Any = None) -> Any:
+    current: Any = d
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
 
 
 def _set_nested(d: dict, path: tuple, value: Any) -> None:

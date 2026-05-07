@@ -123,6 +123,9 @@ class CTFAgent:
         model: str = "gpt-4o",
         provider: str = "openai",
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
         max_iterations: int = 20,
         timeout: int = 600,
         retry_on_failure: bool = True,
@@ -141,7 +144,14 @@ class CTFAgent:
 
         self.memory = Memory()
         self.classifier = ChallengeClassifier()
-        self.planner = Planner(model=model, provider=provider, api_key=api_key)
+        self.planner = Planner(
+            model=model,
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         self.executor = Executor(
             model=model, provider=provider, api_key=api_key,
             sandbox_enabled=sandbox_enabled,

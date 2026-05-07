@@ -45,6 +45,27 @@ class TestPlanner:
         plan = planner._fallback_plan(None, "test error")
         assert len(plan.actions) == 0
 
+    def test_openai_provider_accepts_custom_base_url(self):
+        """OpenAI-compatible providers should pass custom base_url to the client."""
+        planner = Planner(
+            model="MiMo-V2.5-Pro",
+            provider="openai",
+            api_key="test-key",
+            base_url="https://token-plan-sgp.xiaomimimo.com/v1/",
+        )
+
+        assert planner.base_url == "https://token-plan-sgp.xiaomimimo.com/v1"
+
+    def test_web_fallback_probes_php_eval_parameter(self):
+        """Fallback web recon should include a deterministic PHP eval POST probe."""
+        planner = Planner()
+        plan = planner._fallback_plan("http://target.com", "connection error", category="web")
+
+        commands = "\n".join(action.command for action in plan.actions)
+        assert "--data-urlencode" in commands
+        assert "CTF_AGENT_RCE" in commands
+        assert "get_flag.php" in commands
+
     def test_auth_error_disables_repeated_llm_calls(self):
         """Authentication failures should fall back once, then stop cleanly."""
         planner = Planner()

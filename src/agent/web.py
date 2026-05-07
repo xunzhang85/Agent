@@ -7,8 +7,9 @@ and API endpoints for integration.
 
 import json
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .tab{padding:6px 14px;border-radius:6px 6px 0 0;font-size:0.82em;cursor:pointer;color:var(--dim);transition:all 0.15s}
         .tab:hover{color:var(--text);background:rgba(59,130,246,0.05)}
         .tab.active{color:var(--accent);background:rgba(59,130,246,0.1);border-bottom:2px solid var(--accent)}
+        .toggles{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
+        .check{font-size:0.82em;color:var(--dim);display:flex;align-items:center;gap:5px;cursor:pointer}
+        .check input{width:auto}
+        .meta{color:var(--dim);font-size:0.78em;margin-bottom:10px;min-height:18px}
     </style>
 </head>
 <body>
@@ -118,27 +123,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="form-group">
                         <label>Model</label>
                         <select id="fModel">
-                            <option value="gpt-4o">GPT-4o</option>
-                            <option value="gpt-4o-mini">GPT-4o Mini</option>
-                            <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
-                            <option value="deepseek-chat">DeepSeek</option>
+                            <option value="">Loading...</option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label>Provider</label>
                         <select id="fProvider">
                             <option value="openai">OpenAI</option>
+                            <option value="openai-compatible">OpenAI-compatible</option>
+                            <option value="mimo">MiMo</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="deepseek">DeepSeek</option>
                             <option value="ollama">Ollama</option>
                         </select>
                     </div>
+                    <div class="form-group">
+                        <label>Timeout</label>
+                        <input type="number" id="fTimeout" min="10" max="3600" step="10" value="600">
+                    </div>
+                </div>
+                <div class="meta" id="cfgMeta"></div>
+                <div class="toggles">
+                    <label class="check"><input type="checkbox" id="fNoCache"> No cache</label>
+                    <label class="check"><input type="checkbox" id="fNoSandbox"> No sandbox</label>
                 </div>
                 <div style="display:flex;gap:8px;align-items:center">
                     <button type="submit" class="btn btn-primary" id="solveBtn">🚀 Solve</button>
-                    <label style="font-size:0.82em;color:var(--dim);display:flex;align-items:center;gap:4px;cursor:pointer">
-                        <input type="checkbox" id="fStream" checked> Stream
-                    </label>
                 </div>
             </form>
             <div id="resultBox" class="hidden" style="margin-top:14px">
@@ -190,6 +200,7 @@ Solve: Input → Classify → [Plan → Execute → Review] × N → Flag!</div>
 const $=s=>document.querySelector(s);
 const API='';
 let solveHistory=[];
+const DEFAULT_MODELS=['gpt-4o','gpt-4o-mini','claude-3-5-sonnet','deepseek-chat','MiMo-V2.5-Pro'];
 
 // Tabs
 document.querySelectorAll('.tab').forEach(t=>{
@@ -210,19 +221,38 @@ fetch(API+'/api/tools').then(r=>r.json()).then(data=>{
     ).join('');
 }).catch(()=>$('#toolGrid').innerHTML='<div style="color:var(--red)">Failed to load</div>');
 
+// Load runtime defaults and persisted history
+fetch(API+'/api/config').then(r=>r.json()).then(data=>{
+    const models=[data.model,...DEFAULT_MODELS].filter(Boolean);
+    $('#fModel').innerHTML=[...new Set(models)].map(m=>`<option value="${m}">${m}</option>`).join('');
+    $('#fModel').value=data.model||models[0];
+    if(data.provider) $('#fProvider').value=data.provider;
+    if(data.timeout) $('#fTimeout').value=data.timeout;
+    $('#fNoSandbox').checked=data.sandbox_enabled===false;
+    $('#cfgMeta').textContent=`Config: ${data.provider||'openai'} / ${data.model||'gpt-4o'}${data.base_url_configured?' / custom base_url':''}${data.api_key_configured?' / key set':' / no key'}`;
+}).catch(()=>{
+    $('#fModel').innerHTML=DEFAULT_MODELS.map(m=>`<option value="${m}">${m}</option>`).join('');
+});
+
+fetch(API+'/api/history').then(r=>r.json()).then(data=>{
+    solveHistory=(Array.isArray(data)?data:[]).slice(-10).reverse();
+    updateStats();
+}).catch(()=>{});
+
 // Solve
 $('#solveForm').addEventListener('submit',async e=>{
     e.preventDefault();
     const btn=$('#solveBtn'),log=$('#solveLog'),box=$('#resultBox');
     btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Solving...';
     box.classList.remove('hidden');log.innerHTML='';
-    const url=$('#fUrl').value,text=$('#fText').value,cat=$('#fCat').value,model=$('#fModel').value,provider=$('#fProvider').value;
+    const url=$('#fUrl').value.trim(),text=$('#fText').value.trim(),cat=$('#fCat').value,model=$('#fModel').value,provider=$('#fProvider').value;
+    const timeout=parseInt($('#fTimeout').value||'600',10),no_cache=$('#fNoCache').checked,sandbox_enabled=!$('#fNoSandbox').checked;
 
     addLog('🧠 Analyzing challenge...','log-plan');
 
     try{
         const resp=await fetch(API+'/api/solve',{method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({url,text,category:cat==='auto'?null:cat,model,provider})});
+            body:JSON.stringify({url,text,category:cat==='auto'?null:cat,model,provider,timeout,no_cache,sandbox_enabled})});
         const data=await resp.json();
         if(!resp.ok) throw new Error(data.error||'Request failed');
 
@@ -273,14 +303,17 @@ class WebHandler(BaseHTTPRequestHandler):
     """HTTP handler for web dashboard."""
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
             self._respond(200, "text/html", HTML_TEMPLATE)
-        elif self.path == "/api/tools":
+        elif path == "/api/tools":
             from agent.tools.registry import ToolRegistry
             self._respond(200, "application/json", json.dumps(ToolRegistry().list_tools()))
-        elif self.path == "/api/health":
+        elif path == "/api/health":
             self._respond(200, "application/json", json.dumps({"status": "ok", "version": "0.2.0"}))
-        elif self.path == "/api/history":
+        elif path == "/api/config":
+            self._respond(200, "application/json", json.dumps(self.server.safe_config()))
+        elif path == "/api/history":
             results = []
             results_dir = Path("results")
             if results_dir.exists():
@@ -298,7 +331,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", "Not Found")
 
     def do_POST(self):
-        if self.path == "/api/solve":
+        path = urlparse(self.path).path
+        if path == "/api/solve":
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(content_length) or b"{}")
@@ -312,21 +346,24 @@ class WebHandler(BaseHTTPRequestHandler):
 
             from agent.core.agent import CTFAgent
             from agent.utils.config import load_config
+            from agent.utils.config import get_bool, get_float, get_int
 
             config = load_config(getattr(self.server, "config_path", None))
             llm = config.get("llm", {})
-            agent_cfg = config.get("agent", {})
             sandbox_cfg = config.get("sandbox", {})
 
             agent = CTFAgent(
                 model=body.get("model") or llm.get("model") or "gpt-4o",
                 provider=body.get("provider") or llm.get("provider") or "openai",
                 api_key=llm.get("api_key"),
-                timeout=int(body.get("timeout") or agent_cfg.get("timeout") or 600),
-                max_iterations=int(agent_cfg.get("max_iterations") or 20),
-                max_retries=int(agent_cfg.get("max_retries") or 3),
-                retry_on_failure=bool(agent_cfg.get("retry_on_failure", True)),
-                sandbox_enabled=sandbox_cfg.get("enabled"),
+                base_url=llm.get("base_url"),
+                temperature=get_float(config, ("llm", "temperature"), 0.1),
+                max_tokens=get_int(config, ("llm", "max_tokens"), 4096),
+                timeout=int(body.get("timeout") or get_int(config, ("agent", "timeout"), 600)),
+                max_iterations=get_int(config, ("agent", "max_iterations"), 20),
+                max_retries=get_int(config, ("agent", "max_retries"), 3),
+                retry_on_failure=get_bool(config, ("agent", "retry_on_failure"), True),
+                sandbox_enabled=body.get("sandbox_enabled", sandbox_cfg.get("enabled")),
                 cache_enabled=not body.get("no_cache", False),
             )
 
@@ -335,7 +372,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 challenge_text=body.get("text"),
                 category=body.get("category"),
             )
-            self._respond(200, "application/json", json.dumps(result.to_dict()))
+            self._respond(200, "application/json", json.dumps(result.to_dict(), ensure_ascii=False))
         else:
             self._respond(404, "text/plain", "Not Found")
 
@@ -357,12 +394,27 @@ class WebHandler(BaseHTTPRequestHandler):
         logger.info(f"{self.client_address[0]} - {format % args}")
 
 
-class AgentHTTPServer(HTTPServer):
+class AgentHTTPServer(ThreadingHTTPServer):
     """HTTP server carrying runtime configuration path."""
 
     def __init__(self, server_address, handler_class, config_path=None):
         super().__init__(server_address, handler_class)
         self.config_path = config_path
+
+    def safe_config(self) -> dict:
+        from agent.utils.config import get_bool, get_int, load_config
+
+        config = load_config(self.config_path)
+        llm = config.get("llm", {})
+        return {
+            "model": llm.get("model") or "gpt-4o",
+            "provider": llm.get("provider") or "openai",
+            "timeout": get_int(config, ("agent", "timeout"), 600),
+            "max_iterations": get_int(config, ("agent", "max_iterations"), 20),
+            "sandbox_enabled": get_bool(config, ("sandbox", "enabled"), True),
+            "api_key_configured": bool(llm.get("api_key")),
+            "base_url_configured": bool(llm.get("base_url")),
+        }
 
 
 def start_web(port: int = 8080, host: str = "0.0.0.0", config_path: str | None = None):

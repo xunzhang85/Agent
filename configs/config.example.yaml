@@ -2,11 +2,16 @@
 # Copy to configs/config.yaml and fill in your values
 
 llm:
-  # Supported providers: openai, anthropic, deepseek, ollama
+  # Supported providers: openai, openai-compatible, mimo, anthropic, deepseek, ollama
   provider: openai
   model: gpt-4o
   # API key can also be set via OPENAI_API_KEY env var
   api_key: ${OPENAI_API_KEY}
+  # For OpenAI-compatible providers such as MiMo, set base_url and model:
+  # provider: openai
+  # model: MiMo-V2.5-Pro
+  # base_url: https://token-plan-sgp.xiaomimimo.com/v1
+  base_url:
   temperature: 0.1
   max_tokens: 4096
 

