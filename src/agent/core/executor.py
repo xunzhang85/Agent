@@ -1,8 +1,8 @@
 """
 Executor - Task Execution Module (Optimized)
 
-Async execution, result caching, better error handling, and
-sandboxed Docker execution with resource limits.
+Async execution, result caching, better error handling,
+sandboxed Docker execution with resource limits, and command safety filtering.
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import tempfile
 import time
 import hashlib
 import shutil
+import re
 from dataclasses import dataclass
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,37 @@ from concurrent.futures import ThreadPoolExecutor
 from agent.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Dangerous command patterns that should never be executed locally
+_DANGEROUS_PATTERNS = [
+    r"\brm\s+-rf\s+/\b",          # rm -rf /
+    r"\bmkfs\b",                    # filesystem formatting
+    r"\bdd\s+if=",                  # raw disk write
+    r"\bwipefs\b",
+    r"\bshred\b",
+    r"\b>\s*/dev/sd",              # write to block device
+    r"\bbash\s+-i\s+>&\s*/dev/tcp/",  # reverse shell
+    r"\bnc\s+.*-e\s*/bin/",        # netcat reverse shell
+    r"\bpython.*socket.*connect",  # python reverse shell
+    r"\bcrontab\s+-e\b",           # cron modification (system-level)
+    r"\buseradd\b",
+    r"\busermod\b",
+    r"\bpasswd\b",
+    r"\bvisudo\b",
+    r"\bsystemctl\s+enable\b",
+    r"\bchmod\s+.*\s+/\b",
+    r"\bchown\s+.*\s+/\b",
+]
+_DANGEROUS_RE = [re.compile(p, re.IGNORECASE) for p in _DANGEROUS_PATTERNS]
+
+
+def _is_command_safe(command: str) -> bool:
+    """Check if a command is safe to execute. Returns False for dangerous patterns."""
+    for pattern in _DANGEROUS_RE:
+        if pattern.search(command):
+            logger.warning("Blocked dangerous command: %s", command[:200])
+            return False
+    return True
 
 
 @dataclass
@@ -43,15 +75,18 @@ class CommandCache:
         self._ttl = ttl
 
     def _key(self, command: str) -> str:
-        return hashlib.md5(command.encode()).hexdigest()
+        return hashlib.sha256(command.encode()).hexdigest()[:32]
 
     def get(self, command: str) -> Optional[ExecutionResult]:
         key = self._key(command)
         if key in self._cache:
             ts, result = self._cache[key]
             if time.time() - ts < self._ttl:
-                result.cached = True
-                return result
+                # Return a copy to avoid mutating the cached object
+                import copy
+                cached_result = copy.copy(result)
+                cached_result.cached = True
+                return cached_result
             del self._cache[key]
         return None
 
@@ -84,6 +119,7 @@ class Executor:
         self._working_dir = tempfile.mkdtemp(prefix="ctf_agent_")
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._cache = CommandCache(ttl=cache_ttl)
+        self._closed = False
 
     def _resolve_sandbox(self, requested: Optional[bool]) -> bool:
         """Enable Docker sandbox only when the local runtime can actually use it."""
@@ -119,7 +155,17 @@ class Executor:
 
     def execute(self, action, timeout: Optional[int] = None) -> ExecutionResult:
         """Sync execute an action."""
-        return asyncio.run(self.async_execute(action, timeout))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        coro = self.async_execute(action, timeout)
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return asyncio.run(coro)
 
     async def async_execute(self, action, timeout: Optional[int] = None) -> ExecutionResult:
         """Async execute an action."""
@@ -127,17 +173,27 @@ class Executor:
         command = action.command
         tool = action.tool
 
+        # Safety check
+        if not _is_command_safe(command):
+            return ExecutionResult(
+                success=False,
+                error="Command blocked by safety filter",
+                tool=tool,
+                command=command[:200],
+                elapsed_time=0.0,
+            )
+
         # Check cache
         cached = self._cache.get(command)
         if cached:
-            logger.debug(f"Cache hit for [{tool}]: {command[:60]}")
+            logger.debug("Cache hit for [%s]: %s", tool, command[:60])
             return cached
 
-        logger.info(f"Executing [{tool}]: {command[:100]}")
+        logger.info("Executing [%s]: %s", tool, command[:100])
         start = time.time()
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             if self.sandbox_enabled:
                 result = await loop.run_in_executor(
                     self._pool, self._execute_sandboxed, command, effective_timeout,
@@ -168,7 +224,7 @@ class Executor:
                 tool=tool, command=command, elapsed_time=effective_timeout,
             )
         except Exception as e:
-            logger.error(f"Execution error: {e}")
+            logger.error("Execution error: %s", e)
             return ExecutionResult(
                 success=False, error=str(e),
                 tool=tool, command=command, elapsed_time=time.time() - start,
@@ -202,7 +258,6 @@ class Executor:
                 f"curl -s --max-time 10 {quoted_url} | head -150",
             ])
         if text:
-            # Extract URLs from text
             commands.append(f"printf '%s\\n' {shlex.quote(text[:500])} | grep -oE 'https?://[^ ]+' || true")
 
         if not commands:
@@ -214,9 +269,14 @@ class Executor:
 
     def cleanup(self):
         """Clean up resources."""
-        import shutil
+        if self._closed:
+            return
+        self._closed = True
         self._pool.shutdown(wait=False)
         try:
             shutil.rmtree(self._working_dir, ignore_errors=True)
         except Exception:
             pass
+
+    def __del__(self):
+        self.cleanup()

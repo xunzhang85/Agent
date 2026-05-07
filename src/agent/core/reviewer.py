@@ -145,17 +145,35 @@ class Reviewer:
         return True
 
     def _check_base64_flags(self, text: str) -> list[tuple[str, float]]:
-        """Check for base64-encoded flags."""
+        """Check for base64-encoded flags (only in explicit base64 contexts)."""
         import base64
         results = []
-        b64_pattern = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
-        for match in b64_pattern.findall(text):
+
+        # Only check strings near base64 indicators to reduce false positives
+        b64_context_pattern = re.compile(
+            r"(?:base64[:=]|b64[:=]|encoded[:=])\s*([A-Za-z0-9+/]{16,}={0,2})",
+            re.IGNORECASE,
+        )
+        for match in b64_context_pattern.finditer(text):
+            encoded = match.group(1)
             try:
-                decoded = base64.b64decode(match).decode("utf-8", errors="ignore")
+                decoded = base64.b64decode(encoded).decode("utf-8", errors="ignore")
                 if re.search(r"(flag|ctf)\{[^}]+\}", decoded, re.IGNORECASE):
                     results.append((decoded, 0.95))
             except Exception:
                 pass
+
+        # Also check standalone long base64 strings (80+ chars, higher bar)
+        standalone_pattern = re.compile(r"[A-Za-z0-9+/]{80,}={0,2}")
+        for match in standalone_pattern.finditer(text):
+            encoded = match.group()
+            try:
+                decoded = base64.b64decode(encoded).decode("utf-8", errors="ignore")
+                if re.search(r"(flag|ctf)\{[^}]+\}", decoded, re.IGNORECASE):
+                    results.append((decoded, 0.85))
+            except Exception:
+                pass
+
         return results
 
     def _analyze_progress(self, output: str, category: str, steps: Optional[list[str]]) -> Optional[str]:

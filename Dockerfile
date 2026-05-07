@@ -34,8 +34,9 @@ RUN useradd -m -s /bin/bash ctfuser
 WORKDIR /workspace
 RUN chown ctfuser:ctfuser /workspace
 
-# Install Python dependencies
-COPY pyproject.toml /tmp/
+# Install Python dependencies (copy source for editable-like install)
+COPY pyproject.toml /tmp/pyproject.toml
+COPY src/ /tmp/src/
 RUN pip install --no-cache-dir /tmp/ 2>/dev/null || \
     pip install --no-cache-dir openai anthropic pyyaml rich click httpx pydantic
 

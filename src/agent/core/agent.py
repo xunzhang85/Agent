@@ -6,6 +6,7 @@ Implements async execution, caching, and streaming support.
 """
 
 import asyncio
+import copy
 import time
 import logging
 import hashlib
@@ -67,8 +68,10 @@ class ResultCache:
         self._load_disk_cache()
 
     def _key(self, url: Optional[str], text: Optional[str], category: Optional[str]) -> str:
-        content = f"{url or ''}|{text or ''}|{category or ''}"
-        return hashlib.md5(content.encode()).hexdigest()
+        # Truncate text to avoid hashing huge payloads
+        text_part = (text or "")[:2000]
+        content = f"{url or ''}|{text_part}|{category or ''}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     def _load_disk_cache(self):
         cache_file = self._cache_dir / "results.json"
@@ -84,7 +87,7 @@ class ResultCache:
         cache_file = self._cache_dir / "results.json"
         try:
             data = {k: v.to_dict() for k, v in self._memory.items()}
-            cache_file.write_text(json.dumps(data, indent=2))
+            cache_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         except Exception:
             pass
 
@@ -92,12 +95,15 @@ class ResultCache:
         key = self._key(url, text, category)
         result = self._memory.get(key)
         if result:
-            result.cached = True
-        return result
+            # Return a copy to avoid mutating the cached object
+            cached = copy.deepcopy(result)
+            cached.cached = True
+            return cached
+        return None
 
     def put(self, url: Optional[str], text: Optional[str], category: Optional[str], result: SolveResult):
         key = self._key(url, text, category)
-        self._memory[key] = result
+        self._memory[key] = copy.deepcopy(result)
         self._save_disk_cache()
 
 
@@ -109,6 +115,10 @@ class CTFAgent:
         # Sync
         agent = CTFAgent(model="gpt-4o")
         result = agent.solve(challenge_url="http://target.ctf.com")
+
+        # Context manager (recommended)
+        with CTFAgent(model="gpt-4o") as agent:
+            result = agent.solve(challenge_url="http://target.ctf.com")
 
         # Async
         result = await agent.asolve(challenge_url="http://target.ctf.com")
@@ -144,7 +154,7 @@ class CTFAgent:
         self.timeout = timeout
         self.retry_on_failure = retry_on_failure
         self.max_retries = max_retries
-        self.on_progress = on_progress
+        self._on_progress = on_progress
 
         # Fallback model config
         self.fallback_model = fallback_model
@@ -170,17 +180,46 @@ class CTFAgent:
         self.reviewer = Reviewer()
         self.cache = ResultCache() if cache_enabled else None
 
-        logger.info(f"CTFAgent initialized: model={model}, provider={provider}")
+        logger.info("CTFAgent initialized: model=%s, provider=%s", model, provider)
         if self.fallback_model:
-            logger.info(f"Fallback model: {self.fallback_model} ({self.fallback_provider})")
+            logger.info("Fallback model: %s (%s)", self.fallback_model, self.fallback_provider)
+
+    # --- Context manager support ---
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        """Release resources (temp dirs, thread pools)."""
+        if hasattr(self, "executor"):
+            self.executor.cleanup()
+
+    def __del__(self):
+        self.close()
+
+    # --- Progress callback ---
+
+    @property
+    def on_progress(self):
+        return self._on_progress
+
+    @on_progress.setter
+    def on_progress(self, value):
+        self._on_progress = value
 
     def _emit(self, event_type: str, data: dict):
         """Emit progress event to callback."""
-        if self.on_progress:
+        if self._on_progress:
             try:
-                self.on_progress({"type": event_type, **data})
+                self._on_progress({"type": event_type, **data})
             except Exception:
                 pass
+
+    # --- Public API ---
 
     def solve(
         self,
@@ -191,7 +230,18 @@ class CTFAgent:
         use_cache: bool = True,
     ) -> SolveResult:
         """Synchronous solve wrapper."""
-        return asyncio.run(self.asolve(challenge_url, challenge_text, category, timeout, use_cache))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.asolve(challenge_url, challenge_text, category, timeout, use_cache))
+
+        # Already inside an event loop (Jupyter, async framework, etc.)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                asyncio.run,
+                self.asolve(challenge_url, challenge_text, category, timeout, use_cache),
+            ).result()
 
     async def asolve(
         self,
@@ -258,7 +308,7 @@ class CTFAgent:
                 # Check if primary model failed and fallback is available
                 if hasattr(self.planner, '_model_unsupported') and self.planner._model_unsupported:
                     if self.fallback_model and not self._using_fallback:
-                        logger.warning(f"Primary model unsupported, switching to fallback: {self.fallback_model}")
+                        logger.warning("Primary model unsupported, switching to fallback: %s", self.fallback_model)
                         self.planner = Planner(
                             model=self.fallback_model,
                             provider=self.fallback_provider or "openai",
@@ -281,7 +331,7 @@ class CTFAgent:
                         "Planner produced no executable actions", solve_id,
                     )
 
-                # Execute actions (parallel where possible)
+                # Execute actions (parallel where possible, with concurrency limit)
                 results = await self._execute_actions(plan.actions)
                 for action, result in zip(plan.actions, results):
                     if result.output:
@@ -335,7 +385,8 @@ class CTFAgent:
         category: Optional[str] = None,
     ) -> AsyncGenerator[dict, None]:
         """Streaming solve - yields events as they happen."""
-        self.on_progress = lambda event: None  # Events come via yield
+        saved_progress = self._on_progress
+        self._on_progress = None  # Disable callback during streaming
 
         import uuid
         solve_id = str(uuid.uuid4())[:8]
@@ -343,83 +394,91 @@ class CTFAgent:
         steps = []
         iterations = 0
 
-        if not category:
-            category = self.classifier.classify(url=challenge_url, text=challenge_text).value
-            yield {"type": "classified", "category": category, "solve_id": solve_id}
+        try:
+            if not category:
+                category = self.classifier.classify(url=challenge_url, text=challenge_text).value
+                yield {"type": "classified", "category": category, "solve_id": solve_id}
 
-        recon = await self.executor.async_reconnaissance(challenge_url, challenge_text)
-        if recon.output:
-            steps.append(f"[Recon] {recon.output[:300]}")
-            self.memory.add("recon", recon.output)
-            yield {"type": "recon", "output": recon.output[:200], "solve_id": solve_id}
+            recon = await self.executor.async_reconnaissance(challenge_url, challenge_text)
+            if recon.output:
+                steps.append(f"[Recon] {recon.output[:300]}")
+                self.memory.add("recon", recon.output)
+                yield {"type": "recon", "output": recon.output[:200], "solve_id": solve_id}
 
-        for attempt in range(self.max_retries if self.retry_on_failure else 1):
-            while iterations < self.max_iterations:
-                if time.time() - start_time > self.timeout:
-                    yield {"type": "timeout", "solve_id": solve_id}
-                    return
+            for attempt in range(self.max_retries if self.retry_on_failure else 1):
+                while iterations < self.max_iterations:
+                    if time.time() - start_time > self.timeout:
+                        yield {"type": "timeout", "solve_id": solve_id}
+                        return
 
-                iterations += 1
-                yield {"type": "iteration", "n": iterations, "solve_id": solve_id}
+                    iterations += 1
+                    yield {"type": "iteration", "n": iterations, "solve_id": solve_id}
 
-                context = self.memory.get_context()
-                plan = await self.planner.async_plan(
-                    challenge_url=challenge_url,
-                    challenge_text=challenge_text,
-                    category=category,
-                    context=context,
-                    previous_steps=steps,
-                )
+                    context = self.memory.get_context()
+                    plan = await self.planner.async_plan(
+                        challenge_url=challenge_url,
+                        challenge_text=challenge_text,
+                        category=category,
+                        context=context,
+                        previous_steps=steps,
+                    )
 
-                steps.append(f"[Plan] {plan.reasoning[:200]}")
-                yield {"type": "plan", "reasoning": plan.reasoning[:200], "actions": len(plan.actions), "solve_id": solve_id}
+                    steps.append(f"[Plan] {plan.reasoning[:200]}")
+                    yield {"type": "plan", "reasoning": plan.reasoning[:200], "actions": len(plan.actions), "solve_id": solve_id}
 
-                if not plan.actions:
-                    yield {
-                        "type": "failed",
-                        "error": "Planner produced no executable actions",
-                        "iterations": iterations,
-                        "elapsed": time.time() - start_time,
-                        "solve_id": solve_id,
-                    }
-                    return
+                    if not plan.actions:
+                        yield {
+                            "type": "failed",
+                            "error": "Planner produced no executable actions",
+                            "iterations": iterations,
+                            "elapsed": time.time() - start_time,
+                            "solve_id": solve_id,
+                        }
+                        return
 
-                results = await self._execute_actions(plan.actions)
-                for action, result in zip(plan.actions, results):
-                    if result.output:
-                        steps.append(f"[Exec:{action.tool}] {result.output[:200]}")
-                        self.memory.add(f"exec:{action.tool}", result.output)
-                    yield {"type": "exec", "tool": action.tool, "success": result.success, "output": result.output[:100], "solve_id": solve_id}
+                    results = await self._execute_actions(plan.actions)
+                    for action, result in zip(plan.actions, results):
+                        if result.output:
+                            steps.append(f"[Exec:{action.tool}] {result.output[:200]}")
+                            self.memory.add(f"exec:{action.tool}", result.output)
+                        yield {"type": "exec", "tool": action.tool, "success": result.success, "output": result.output[:100], "solve_id": solve_id}
 
-                review = self.reviewer.review(output="\n".join(steps), category=category, steps=steps)
-                if review.flag_found:
-                    yield {"type": "solved", "flag": review.flag, "iterations": iterations, "elapsed": time.time() - start_time, "solve_id": solve_id}
-                    return
+                    review = self.reviewer.review(output="\n".join(steps), category=category, steps=steps)
+                    if review.flag_found:
+                        yield {"type": "solved", "flag": review.flag, "iterations": iterations, "elapsed": time.time() - start_time, "solve_id": solve_id}
+                        return
 
-                if review.should_stop:
-                    yield {"type": "stopped", "solve_id": solve_id}
-                    break
+                    if review.should_stop:
+                        yield {"type": "stopped", "solve_id": solve_id}
+                        break
 
-                if review.new_hint:
-                    self.memory.add("hint", review.new_hint)
-                    yield {"type": "hint", "hint": review.new_hint, "solve_id": solve_id}
+                    if review.new_hint:
+                        self.memory.add("hint", review.new_hint)
+                        yield {"type": "hint", "hint": review.new_hint, "solve_id": solve_id}
 
-            if attempt < self.max_retries - 1 and self.retry_on_failure:
-                yield {"type": "retry", "attempt": attempt + 2, "solve_id": solve_id}
+                if attempt < self.max_retries - 1 and self.retry_on_failure:
+                    yield {"type": "retry", "attempt": attempt + 2, "solve_id": solve_id}
 
-        yield {"type": "failed", "error": "Max iterations exhausted", "iterations": iterations, "elapsed": time.time() - start_time, "solve_id": solve_id}
+            yield {"type": "failed", "error": "Max iterations exhausted", "iterations": iterations, "elapsed": time.time() - start_time, "solve_id": solve_id}
+        finally:
+            self._on_progress = saved_progress  # Restore callback
 
     async def _execute_actions(self, actions: list) -> list[ExecutionResult]:
-        """Execute actions, running independent ones in parallel."""
-        # Group by dependency (simple heuristic: same-tool sequential, different-tool parallel)
+        """Execute actions, running independent ones in parallel with concurrency limit."""
         if len(actions) <= 1:
             return [await self.executor.async_execute(a) for a in actions]
 
-        # Check if actions are independent (different tools)
+        # Limit concurrent executions to avoid resource exhaustion
+        semaphore = asyncio.Semaphore(4)
+
+        async def _limited(action):
+            async with semaphore:
+                return await self.executor.async_execute(action)
+
         tools = set(a.tool for a in actions)
         if len(tools) == len(actions):
-            # All different tools - run in parallel
-            return await asyncio.gather(*[self.executor.async_execute(a) for a in actions])
+            # All different tools - run in parallel (limited by semaphore)
+            return await asyncio.gather(*[_limited(a) for a in actions])
         else:
             # Some share tools - run sequentially for safety
             return [await self.executor.async_execute(a) for a in actions]

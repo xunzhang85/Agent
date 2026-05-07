@@ -118,17 +118,18 @@ class Memory:
     def get_context(self, max_tokens: int = 6000) -> str:
         """Get formatted context for the Planner with token budget."""
         # Score entries by recency + importance
+        recent = self._entries[-self.context_window:]
         scored = []
-        total = len(self._entries)
-        for i, entry in enumerate(self._entries[-self.context_window:]):
-            recency_score = (i + 1) / self.context_window
+        for i, entry in enumerate(recent):
+            recency_score = (i + 1) / len(recent) if recent else 0
             importance_score = entry.importance / 5.0
             score = recency_score * 0.4 + importance_score * 0.6
             scored.append((score, entry))
 
+        # Sort by score descending, pick top entries within budget
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        parts = []
+        selected = []
         char_budget = max_tokens * 4
         used = 0
 
@@ -136,11 +137,13 @@ class Memory:
             line = f"[{entry.category}] {entry.content}"
             if used + len(line) > char_budget:
                 break
-            parts.append(line)
+            selected.append(entry)
             used += len(line)
 
-        # Chronological order
-        return "\n".join(reversed(parts))
+        # Restore chronological order for selected entries
+        selected.sort(key=lambda e: e.id)
+
+        return "\n".join(f"[{e.category}] {e.content}" for e in selected)
 
     def get_recent(self, n: int = 10) -> list[MemoryEntry]:
         """Get N most recent entries."""

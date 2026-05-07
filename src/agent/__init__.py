@@ -5,7 +5,7 @@ A multi-agent system for automatically solving Capture The Flag (CTF)
 challenges using Large Language Models.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "xunzhang85"
 
 from agent.core.agent import CTFAgent

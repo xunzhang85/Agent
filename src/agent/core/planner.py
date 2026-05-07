@@ -298,7 +298,7 @@ Output ONLY valid JSON."""
 
     async def async_call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """Async LLM call using thread pool."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._call_llm, system_prompt, user_prompt)
 
     def plan(self, challenge_url=None, challenge_text=None, category="unknown",
@@ -341,7 +341,16 @@ Output ONLY valid JSON."""
             lines = response.split("\n")
             response = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        data = json.loads(response)
+        # Try direct parse first, then extract JSON block if it fails
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError:
+            # Extract the outermost JSON object from the response
+            match = re.search(r"\{.*\}", response, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+            else:
+                raise
         actions = []
         for a in data.get("actions", []):
             actions.append(Action(

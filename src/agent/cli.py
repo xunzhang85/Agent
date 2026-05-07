@@ -202,6 +202,7 @@ def _display_result(result, output):
 @click.pass_context
 def batch(ctx, file, output, parallel):
     """📋 Batch solve multiple challenges."""
+    import asyncio
     from agent.core.agent import CTFAgent
 
     with open(file) as f:
@@ -216,20 +217,40 @@ def batch(ctx, file, output, parallel):
 
     console.print(f"[cyan]📋 Loading {len(challenges)} challenges (parallel={parallel})[/cyan]")
 
-    agent = CTFAgent(**_agent_kwargs(ctx))
+    kwargs = _agent_kwargs(ctx)
     results = []
 
-    with Progress(console=console) as progress:
-        task = progress.add_task("Solving...", total=len(challenges))
-        for ch in challenges:
-            result = agent.solve(
+    async def _solve_one(ch, idx):
+        with CTFAgent(**kwargs) as agent:
+            result = await agent.asolve(
                 challenge_url=ch.get("url"),
                 challenge_text=ch.get("text"),
                 category=ch.get("category"),
             )
-            results.append(result.to_dict())
-            status = "✅" if result.success else "❌"
-            progress.update(task, advance=1, description=f"{status} {ch.get('url', 'unknown')[:40]}")
+        return idx, result
+
+    async def _run_batch():
+        semaphore = asyncio.Semaphore(parallel)
+        async def _limited(ch, idx):
+            async with semaphore:
+                return await _solve_one(ch, idx)
+
+        tasks = [_limited(ch, i) for i, ch in enumerate(challenges)]
+        completed = []
+
+        with Progress(console=console) as progress:
+            task = progress.add_task("Solving...", total=len(challenges))
+            for coro in asyncio.as_completed(tasks):
+                idx, result = await coro
+                completed.append((idx, result))
+                status = "✅" if result.success else "❌"
+                progress.update(task, advance=1, description=f"{status} challenges...")
+
+        # Restore original order
+        completed.sort(key=lambda x: x[0])
+        return [r.to_dict() for _, r in completed]
+
+    results = asyncio.run(_run_batch())
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w") as f:
